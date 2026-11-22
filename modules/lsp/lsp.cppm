@@ -304,7 +304,7 @@ export namespace sparsity::lsp {
         if (language == "cpp") {
             return LanguageServer{"clangd", {}};
         }
-        if (language == "java") {
+        /*if (language == "java") {
             auto data = std::filesystem::path{};
             if (const auto *home = std::getenv("HOME"); home != nullptr) {
                 data = std::filesystem::path(home) / ".sparsity" / "lsp" / "java";
@@ -333,7 +333,7 @@ export namespace sparsity::lsp {
                     if (executable(candidate)) return LanguageServer{candidate.string(), arguments};
                 }
             }
-        }
+        }*/
         return std::nullopt;
     }
 

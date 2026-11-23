@@ -4,7 +4,9 @@ target_link_libraries(
         sparsity_tests
         PRIVATE
         files
+        json
         lsp
+        session
 )
 
 add_test(NAME sparsity_tests COMMAND sparsity_tests)

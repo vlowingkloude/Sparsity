@@ -38,12 +38,42 @@ int main() {
     const auto glob = executor.execute(call("glob", {{"pattern", "*.txt"}}));
     const auto grep = executor.execute(call("grep", {{"pattern", "three"}, {"case_sensitive", true}}));
 
+    const auto workspace = root / "workspace";
+    std::filesystem::create_directories(workspace);
+    config::Config workspace_cfg = cfg;
+    workspace_cfg.permissions.mode = "workspace";
+    tools::BashSession workspace_shell(workspace);
+    int approvals = 0;
+    tools::ToolExecutor workspace_executor(
+        tools::make_tools(), workspace_cfg,
+        tools::ToolContext{workspace, root, root, workspace_cfg, &workspace_shell},
+        [&approvals](const tools::ApprovalCard &) {
+            ++approvals;
+            return tools::Approval{};
+        });
+
+    const auto inside_write = workspace_executor.execute(
+        call("write", {{"path", "inside.txt"}, {"content", "ok\n"}}));
+    const auto outside_write = workspace_executor.execute(
+        call("write", {{"path", "../outside-workspace.txt"}, {"content", "no\n"}}));
+    const auto safe_bash = workspace_executor.execute(call("bash", {{"command", "ls"}}));
+    const auto unsafe_bash = workspace_executor.execute(call("bash", {{"command", "touch asked.txt"}}));
+
+    const bool workspace_ok = !inside_write.is_error &&
+                              std::filesystem::is_regular_file(workspace / "inside.txt") &&
+                              outside_write.is_error &&
+                              !std::filesystem::exists(root / "outside-workspace.txt") &&
+                              safe_bash.text.find("inside.txt") != std::string::npos &&
+                              unsafe_bash.is_error &&
+                              !std::filesystem::exists(workspace / "asked.txt") &&
+                              approvals == 2;
     const bool ok = read.text.find("alpha") != std::string::npos &&
                     write.text.find("Wrote") != std::string::npos &&
                     edit.text.find("Edited") != std::string::npos &&
                     bash.text.find("hello") != std::string::npos &&
                     glob.text.find("b.txt") != std::string::npos &&
-                    grep.text.find("three") != std::string::npos;
+                    grep.text.find("three") != std::string::npos &&
+                    workspace_ok;
     std::cout << (ok ? "tools ok\n" : "tools failed\n");
     return ok ? 0 : 1;
 }

@@ -13,7 +13,9 @@
 #include <vector>
 
 import files;
+import json;
 import lsp;
+import session;
 
 namespace sparsity::tests {
     using TestFunction = void (*)();
@@ -289,6 +291,41 @@ namespace {
         CHECK_EQ(lsp::lowercase("ClAnGd"), "clangd");
         CHECK(lsp::language_server_for("cpp").has_value());
         CHECK(!lsp::language_server_for("unsupported").has_value());
+    }
+
+    SPARSITY_TEST(session_time_context_projection) {
+        TemporaryDirectory directory;
+        sparsity::session::Store store(directory.path());
+        auto created = store.create("project", directory.path().string(), "deepseek-flash", "high");
+        const std::string context =
+            "<time-context>\nCurrent local time: 2026-11-23 11:45:00 CET\n</time-context>";
+
+        created->add_context(context);
+        created->add_user("hello");
+        created->add_permission("workspace");
+        created->add_allow_rule("bash:git status");
+        created->add_limits(0, 1.5);
+
+        const auto messages = created->messages();
+        CHECK_EQ(messages.size(), std::size_t{1});
+        CHECK_EQ(messages[0].value("role", std::string{}), std::string{"user"});
+        CHECK_EQ(messages[0]["content"].size(), std::size_t{2});
+        CHECK_EQ(messages[0]["content"][0].value("type", std::string{}), std::string{"text"});
+        CHECK_EQ(messages[0]["content"][0].value("text", std::string{}), context);
+        CHECK_EQ(messages[0]["content"][1].value("text", std::string{}), std::string{"hello"});
+        CHECK_EQ(created->title(), std::string{"hello"});
+        CHECK_EQ(created->message_count(), 1);
+        CHECK_EQ(created->permission(), std::string{"workspace"});
+        CHECK(created->allow_rules().contains("bash:git status"));
+        CHECK_EQ(created->limits().max_steps.value_or(-1), 0);
+        CHECK_EQ(created->limits().max_turn_cost.value_or(-1.0), 1.5);
+
+        const auto restored = store.load("project", created->id());
+        CHECK(restored != nullptr);
+        CHECK_EQ(restored->permission(), std::string{"workspace"});
+        CHECK(restored->allow_rules().contains("bash:git status"));
+        CHECK_EQ(restored->limits().max_steps.value_or(-1), 0);
+        CHECK_EQ(restored->limits().max_turn_cost.value_or(-1.0), 1.5);
     }
 }
 

@@ -18,7 +18,7 @@ export module config;
 export namespace sparsity::config {
 
     struct Permissions {
-        std::string mode{"ask"};
+        std::string mode{"workspace"};
     };
 
     struct Tools {
@@ -46,7 +46,8 @@ export namespace sparsity::config {
         std::string model{"deepseek-flash"};
         std::string effort{"high"};
         int max_output_tokens{65536};
-        int max_steps{80};
+        int max_steps{0};
+        double max_turn_cost{1.0};
         std::string base_url{"https://api.deepseek.com/anthropic"};
         std::string api_root{"https://api.deepseek.com"};
         Permissions permissions;
@@ -81,6 +82,15 @@ namespace sparsity::config {
                                  const std::string &key) {
         if (const auto value = local[key].value<int>()) return value;
         if (const auto value = global[key].value<int>()) return value;
+        return std::nullopt;
+    }
+
+    std::optional<double> double_value(const toml::table &global, const toml::table &local,
+                                       const std::string &key) {
+        if (const auto value = local[key].value<double>()) return value;
+        if (const auto value = local[key].value<int>()) return static_cast<double>(*value);
+        if (const auto value = global[key].value<double>()) return value;
+        if (const auto value = global[key].value<int>()) return static_cast<double>(*value);
         return std::nullopt;
     }
 
@@ -141,6 +151,7 @@ export namespace sparsity::config {
         if (const auto value = string_value(global, local, "effort")) result.effort = trim(*value);
         if (const auto value = int_value(global, local, "max_output_tokens")) result.max_output_tokens = *value;
         if (const auto value = int_value(global, local, "max_steps")) result.max_steps = *value;
+        if (const auto value = double_value(global, local, "max_turn_cost")) result.max_turn_cost = *value;
         if (const auto value = string_value(global, local, "base_url")) result.base_url = trim(*value);
         if (const auto value = string_value(global, local, "api_root")) result.api_root = trim(*value);
         else result.api_root = derive_api_root(result.base_url);
@@ -191,11 +202,12 @@ export namespace sparsity::config {
             throw std::runtime_error("effort must be off, low, high or max");
         }
         if (result.permissions.mode != "ask" && result.permissions.mode != "auto" &&
-            result.permissions.mode != "readonly") {
-            throw std::runtime_error("permissions.mode must be ask, auto or readonly");
+            result.permissions.mode != "readonly" && result.permissions.mode != "workspace") {
+            throw std::runtime_error("permissions.mode must be ask, workspace, auto or readonly");
         }
         if (result.max_output_tokens < 256) throw std::runtime_error("max_output_tokens is too small");
-        if (result.max_steps < 1) throw std::runtime_error("max_steps must be positive");
+        if (result.max_steps < 0) throw std::runtime_error("max_steps must be zero or positive");
+        if (result.max_turn_cost < 0.0) throw std::runtime_error("max_turn_cost must be zero or positive");
         if (result.tools.bash_timeout_s < 1) throw std::runtime_error("tools.bash_timeout_s must be positive");
         if (result.tools.tool_output_limit < 1024) throw std::runtime_error("tools.tool_output_limit is too small");
         if (result.compaction.threshold_ratio < 0.5 || result.compaction.threshold_ratio > 0.95) {

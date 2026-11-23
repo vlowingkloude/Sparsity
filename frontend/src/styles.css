@@ -690,6 +690,19 @@ kbd {
 .diffAfter { color: #4e8f63; }
 
 .chatMarker { margin: 10px 0; padding: 4px 8px; border-radius: 4px; background: #f2f3f5; color: #8c8f9a; font-size: 10px; text-align: center; }
+.loopBubble { margin: 9px 0; padding: 8px 10px; border: 1px solid #e0cfa2; border-radius: 6px; background: #fffbf0; color: #5c4a1f; font-size: 11px; }
+.loopBubble.action { border-color: #d9a441; background: #fff7e0; }
+.loopBubble.decided { opacity: .72; }
+.loopMessage { display: flex; align-items: flex-start; gap: 6px; }
+.loopMessage svg { flex: 0 0 auto; margin-top: 1px; color: #a36a3a; }
+.loopSummary { margin-top: 5px; color: #8c6d3a; font-family: "JetBrains Mono", "Noto Sans Mono CJK SC", "SFMono-Regular", Consolas, monospace; font-size: 10px; white-space: pre-wrap; }
+.loopActions { display: flex; gap: 6px; margin-top: 8px; }
+.loopActions button { padding: 4px 11px; border: 1px solid #c9ccd6; border-radius: 4px; background: #ffffff; color: #3c3f41; font-size: 11px; cursor: pointer; }
+.loopActions button.allow { border-color: #4e8f63; background: #4e8f63; color: #ffffff; }
+.loopActions button.deny { color: #c05a5a; }
+.noticeMarker { display: flex; align-items: center; justify-content: center; gap: 8px; }
+.noticeMarker button { border: 1px solid #c9ccd6; border-radius: 4px; background: #ffffff; color: #3c3f41; padding: 2px 8px; font-size: 10px; cursor: pointer; }
+.noticeMarker button:hover { background: #e8f0fe; }
 .chatError { margin: 9px 0; padding: 7px 9px; border-radius: 4px; background: #c05a5a14; color: #c05a5a; font-size: 12px; }
 .typingDots { color: #5b7db1; }
 .chatTimeline::-webkit-scrollbar, .projectList::-webkit-scrollbar, .treeScroll::-webkit-scrollbar { width: 8px; height: 8px; }
@@ -730,6 +743,16 @@ kbd {
 .chatSessionBar button { height: 24px; padding: 0 8px; border: 1px solid #c9ccd6; border-radius: 4px; background: #ffffff; color: #1f2328; font-size: 10px; cursor: pointer; white-space: nowrap; }
 .chatSessionBar button:hover:not(:disabled) { border-color: #5b7db1; color: #5b7db1; }
 .chatSessionBar button:disabled { opacity: .45; cursor: default; }
+.limitsPanel { position: relative; }
+.limitsPanel > summary { display: flex; align-items: center; height: 24px; padding: 0 8px; border: 1px solid #c9ccd6; border-radius: 4px; background: #ffffff; color: #1f2328; font-size: 10px; cursor: pointer; white-space: nowrap; list-style: none; }
+.limitsPanel > summary::-webkit-details-marker { display: none; }
+.limitsPanel > summary:hover { border-color: #5b7db1; color: #5b7db1; }
+.limitsBody { position: absolute; right: 0; top: calc(100% + 4px); z-index: 30; display: flex; flex-direction: column; gap: 6px; width: 220px; padding: 9px; border: 1px solid #c9ccd6; border-radius: 6px; background: #ffffff; box-shadow: 0 8px 24px #1f232820; }
+.limitsBody label { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #3c3f41; font-size: 10px; }
+.limitsBody input { width: 78px; height: 22px; padding: 0 5px; border: 1px solid #c9ccd6; border-radius: 4px; background: #ffffff; color: #1f2328; font-size: 10px; outline: none; }
+.limitsBody input:focus { border-color: #5b7db1; }
+.limitsBody small { color: #8c8f9a; font-size: 9px; }
+.limitsBody button { align-self: flex-end; height: 22px; }
 .approvalEdit { margin-top: 8px; }
 .approvalEdit textarea { width: 100%; padding: 6px 7px; resize: vertical; border: 1px solid #b8bcc5; border-radius: 4px; outline: none; background: #ffffff; color: #1f2328; font-family: "JetBrains Mono", "Noto Sans Mono CJK SC", "SFMono-Regular", Consolas, monospace; font-size: 10px; line-height: 1.45; }
 .approvalEdit textarea:focus { border-color: #5b7db1; box-shadow: 0 0 0 2px #5b7db133; }

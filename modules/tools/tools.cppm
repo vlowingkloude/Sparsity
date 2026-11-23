@@ -178,7 +178,10 @@ export namespace sparsity::tools {
 
     class ToolExecutor {
     public:
-        ToolExecutor(std::vector<Tool> tools, config::Config config, ToolContext context, Approver approver);
+        ToolExecutor(std::vector<Tool> tools, config::Config config, ToolContext context, Approver approver,
+                     std::set<std::string> allow_rules = {},
+                     std::function<void(const std::string &)> on_allow_rule = {},
+                     std::function<std::string()> permissions_mode = {});
 
         json_type schemas() const;
         std::string summarize(const std::string &name, const json_type &input) const;
@@ -201,6 +204,8 @@ export namespace sparsity::tools {
         ToolContext context_;
         Approver approver_;
         std::set<std::string> allow_rules_;
+        std::function<void(const std::string &)> on_allow_rule_;
+        std::function<std::string()> permissions_mode_;
     };
 
 }
@@ -212,6 +217,64 @@ namespace sparsity::tools {
         if (first == std::string::npos) return {};
         const auto last = value.find_last_not_of(" \t\r\n");
         return value.substr(first, last - first + 1);
+    }
+
+    bool safe_bash_simple(const std::string &command) {
+        static const std::vector<std::string> prefixes = {
+            "git status", "git diff", "git log", "git show", "git branch", "git rev-parse",
+            "ls", "pwd", "cat", "head", "tail", "wc", "rg", "grep", "echo", "printf",
+            "cmake --build", "ctest", "npm test", "npm run test", "npm run build",
+            "pytest", "cargo test", "go test",
+        };
+        for (const auto &prefix: prefixes) {
+            if (command == prefix) return true;
+            if (command.size() > prefix.size() && command.starts_with(prefix) &&
+                std::isspace(static_cast<unsigned char>(command[prefix.size()])) != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool safe_bash_command(const std::string &command) {
+        const auto trimmed = trim(command);
+        if (trimmed.empty()) return false;
+        // A prefix allowlist is only useful for simple commands. Reject
+        // substitution and redirection outright, then require every segment
+        // of a ; && || | chain to be a safe command on its own.
+        if (trimmed.find_first_of("$`<>\n\r") != std::string::npos) return false;
+        std::vector<std::string> segments;
+        std::string current;
+        for (std::size_t index = 0; index < trimmed.size(); ++index) {
+            const char character = trimmed[index];
+            if (character == ';') {
+                segments.push_back(current);
+                current.clear();
+                continue;
+            }
+            if (character == '&') {
+                if (index + 1 < trimmed.size() && trimmed[index + 1] == '&') {
+                    segments.push_back(current);
+                    current.clear();
+                    ++index;
+                    continue;
+                }
+                return false;
+            }
+            if (character == '|') {
+                if (index + 1 < trimmed.size() && trimmed[index + 1] == '|') ++index;
+                segments.push_back(current);
+                current.clear();
+                continue;
+            }
+            current.push_back(character);
+        }
+        segments.push_back(current);
+        for (const auto &segment: segments) {
+            const auto part = trim(segment);
+            if (part.empty() || !safe_bash_simple(part)) return false;
+        }
+        return true;
     }
 
     std::string require_string(const json_type &input, const char *name) {
@@ -1149,9 +1212,12 @@ export namespace sparsity::tools {
     }
 
     ToolExecutor::ToolExecutor(std::vector<Tool> tools, config::Config config, ToolContext context,
-                               Approver approver)
-        : config_(std::move(config)), context_(std::move(context)), approver_(std::move(approver)),
-          order_(std::move(tools)) {
+                               Approver approver, std::set<std::string> allow_rules,
+                               std::function<void(const std::string &)> on_allow_rule,
+                               std::function<std::string()> permissions_mode)
+        : order_(std::move(tools)), config_(std::move(config)), context_(std::move(context)),
+          approver_(std::move(approver)), allow_rules_(std::move(allow_rules)),
+          on_allow_rule_(std::move(on_allow_rule)), permissions_mode_(std::move(permissions_mode)) {
         for (const auto &tool: order_) tools_[tool.name] = tool;
     }
 
@@ -1169,10 +1235,20 @@ export namespace sparsity::tools {
 
     ToolExecutor::Gate ToolExecutor::gate(const Tool &tool, const Prepared &prepared,
                                           const json_type &input) {
-        if (tool.permission == "auto" || config_.permissions.mode == "auto") return {.allowed = true};
-        if (config_.permissions.mode == "readonly") {
+        const auto mode = permissions_mode_ ? permissions_mode_() : config_.permissions.mode;
+        if (tool.permission == "auto" || mode == "auto") return {.allowed = true};
+        if (mode == "readonly") {
             return {.denial = ToolResult::text_result(
                 "readonly mode denied " + tool.name, true, "readonly")};
+        }
+        if (mode == "workspace") {
+            if ((tool.name == "write" || tool.name == "edit") && !prepared.outside_project) {
+                return {.allowed = true};
+            }
+            if (tool.name == "bash" &&
+                safe_bash_command(input.value("command", std::string{}))) {
+                return {.allowed = true};
+            }
         }
 
         const auto rule = tool.name + ":" + tool.signature(input);
@@ -1192,6 +1268,7 @@ export namespace sparsity::tools {
             if (approval.decision == Decision::Allow) return {.allowed = true};
             if (approval.decision == Decision::Always) {
                 allow_rules_.insert(rule);
+                if (on_allow_rule_) on_allow_rule_(rule);
                 return {.allowed = true};
             }
             if (approval.decision == Decision::Deny) {

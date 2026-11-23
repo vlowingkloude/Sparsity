@@ -21,6 +21,10 @@ type ChatPanelProps = {
   models: ModelInfo[];
   model: string;
   effort: string;
+  permissions: string;
+  maxSteps: number;
+  maxTurnCost: number;
+  turnCost: number;
   sessions: SessionMeta[];
   activeSessionId: string | null;
   attachments: UploadAttachment[];
@@ -32,6 +36,9 @@ type ChatPanelProps = {
   onRemoveAttachment: (index: number) => void;
   onModelChange: (id: string) => void;
   onEffortChange: (effort: string) => void;
+  onPermissionsChange: (permissions: string) => void;
+  onLimitsChange: (maxSteps: number, maxTurnCost: number) => void;
+  onLoopDecision: (checkId: string, action: "continue" | "stop") => void;
   items: ChatItem[];
   live: LiveTurn | null;
   todos: TodoItem[];
@@ -51,6 +58,10 @@ export function ChatPanel({
   models,
   model,
   effort,
+  permissions,
+  maxSteps,
+  maxTurnCost,
+  turnCost,
   sessions,
   activeSessionId,
   attachments,
@@ -62,6 +73,9 @@ export function ChatPanel({
   onRemoveAttachment,
   onModelChange,
   onEffortChange,
+  onPermissionsChange,
+  onLimitsChange,
+  onLoopDecision,
   items,
   live,
   todos,
@@ -76,6 +90,8 @@ export function ChatPanel({
   onInterrupt
 }: ChatPanelProps) {
   const [text, setText] = useState("");
+  const [stepsDraft, setStepsDraft] = useState(maxSteps);
+  const [costDraft, setCostDraft] = useState(maxTurnCost);
   const fileRef = useRef<HTMLInputElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const composing = useRef(false);
@@ -94,8 +110,16 @@ export function ChatPanel({
       changed.add(tool.summary);
     }
   };
-  for (const item of items) if (item.kind === "tool") collect(item.call);
+  for (const item of items) {
+    if (item.kind === "tool") collect(item.call);
+    else if (item.kind === "assistant") for (const tool of item.tools) collect(tool);
+  }
   if (live) for (const tool of live.tools) collect(tool);
+
+  useEffect(() => {
+    setStepsDraft(maxSteps);
+    setCostDraft(maxTurnCost);
+  }, [maxSteps, maxTurnCost]);
 
   useEffect(() => {
     const node = scrollRef.current;
@@ -147,6 +171,17 @@ export function ChatPanel({
           >
             {effortOptions.map((option) => <option key={option} value={option}>{option}</option>)}
           </select>
+          <select
+            value={permissions}
+            onChange={(event) => onPermissionsChange(event.target.value)}
+            title="Approval mode: Ask every write/edit/bash, auto-approve project edits and safe read-only commands in Workspace, auto-approve everything in Auto, or deny writes and shell commands in Read only."
+            disabled={blocked}
+          >
+            <option value="ask">Ask</option>
+            <option value="workspace">Workspace</option>
+            <option value="auto">Auto</option>
+            <option value="readonly">Read only</option>
+          </select>
           <span className={`chatStatus ${status}`}>{statusLabel(status)}</span>
         </div>
       </header>
@@ -166,6 +201,24 @@ export function ChatPanel({
         <button type="button" onClick={onNewSession} disabled={connecting}>+ New chat</button>
         <button type="button" onClick={onDeleteSession} disabled={blocked || !activeSessionId} title="Delete session"><Trash2 size={12} /></button>
         <button type="button" onClick={onCompact} disabled={blocked || items.length === 0} title="Compact history">Compact</button>
+        <details className="limitsPanel">
+          <summary title="Session limits">Limits</summary>
+          <div className="limitsBody">
+            <label>
+              Max steps
+              <input type="number" min={0} step={1} value={stepsDraft} disabled={blocked}
+                onChange={(event) => setStepsDraft(Number(event.target.value))} />
+            </label>
+            <small>0 = unlimited</small>
+            <label>
+              Max turn cost ($)
+              <input type="number" min={0} step={0.5} value={costDraft} disabled={blocked}
+                onChange={(event) => setCostDraft(Number(event.target.value))} />
+            </label>
+            <small>0 = no hard cost limit</small>
+            <button type="button" disabled={blocked} onClick={() => onLimitsChange(stepsDraft, costDraft)}>Apply</button>
+          </div>
+        </details>
       </div>
 
       <div className="chatTimeline" ref={scrollRef}>
@@ -175,7 +228,7 @@ export function ChatPanel({
             <p>Ask about this project. Upload an image, text or PDF, search the web, or ask for a change.</p>
           </div>
         ) : null}
-        {items.map((item) => <ChatItemView key={item.id} item={item} />)}
+        {items.map((item) => <ChatItemView key={item.id} item={item} onSend={onSend} onLoopDecision={onLoopDecision} />)}
         {live ? <LiveView live={live} status={status} onDecision={onDecision} /> : null}
       </div>
 
@@ -209,6 +262,7 @@ export function ChatPanel({
               cache {formatTokens(cacheRead)}{inputTokens + cacheRead + cacheCreation > 0 ? ` · ${Math.round((cacheRead / (inputTokens + cacheRead + cacheCreation)) * 100)}%` : ""}
             </span>
           ) : null}
+          <span title="This turn's cost / hard budget">turn ${turnCost.toFixed(2)} / {maxTurnCost > 0 ? `$${maxTurnCost.toFixed(2)}` : "off"}</span>
           <span>${cost.toFixed(4)}</span>
           <span>{currentModel?.id ?? model}</span>
         </div>
@@ -269,7 +323,7 @@ export function ChatPanel({
   );
 }
 
-function ChatItemView({ item }: { item: ChatItem }) {
+function ChatItemView({ item, onSend, onLoopDecision }: { item: ChatItem; onSend: (text: string) => void; onLoopDecision: (checkId: string, action: "continue" | "stop") => void }) {
   if (item.kind === "user") {
     return (
       <article className="chatMessage userMessage">
@@ -303,7 +357,7 @@ function ChatItemView({ item }: { item: ChatItem }) {
       <article className="chatMessage assistantMessage">
         <div className="chatAvatar"><Bot size={14} /></div>
         <div className="chatBubble">
-          <ApprovalView id={item.id} card={item.card} decision={item.decision} onDecision={() => undefined} />
+          <ApprovalView id={item.id} card={item.card} decision={item.decision} onDecision={() => undefined} active={false} />
         </div>
       </article>
     );
@@ -312,6 +366,34 @@ function ChatItemView({ item }: { item: ChatItem }) {
     return (
       <div className="chatMarker">
         <FileText size={13} /> Compacted {formatTokens(item.before)} → {formatTokens(item.after)}
+      </div>
+    );
+  }
+  if (item.kind === "loop") {
+    return (
+      <div className={`loopBubble${item.checkId ? " action" : ""}${item.decision ? " decided" : ""}`}>
+        <div className="loopMessage"><Wrench size={13} /><span>{item.message}</span></div>
+        {item.summary ? <div className="loopSummary">{item.summary}</div> : null}
+        {item.checkId && !item.decision ? (
+          <div className="loopActions">
+            <button type="button" className="allow" onClick={() => onLoopDecision(item.checkId!, "continue")}>Continue</button>
+            <button type="button" className="deny" onClick={() => onLoopDecision(item.checkId!, "stop")}>Stop</button>
+          </div>
+        ) : item.decision ? (
+          <small>{item.decision === "continue" ? "Continued" : "Stopped"}</small>
+        ) : null}
+      </div>
+    );
+  }
+  if (item.kind === "notice") {
+    return (
+      <div className="chatMarker noticeMarker">
+        <span>{item.message}</span>
+        {item.action ? (
+          <button type="button" onClick={() => onSend(item.action!.prompt)}>
+            {item.action.label}
+          </button>
+        ) : null}
       </div>
     );
   }
@@ -338,6 +420,7 @@ function LiveView({
             card={live.approval.card}
             decision={live.approval.decision}
             onDecision={onDecision}
+            active
           />
         ) : null}
         {live.tools.length > 0 ? <ToolActivity tools={live.tools} /> : null}
@@ -401,16 +484,37 @@ function ApprovalView({
   id,
   card,
   decision,
-  onDecision
+  onDecision,
+  active = false
 }: {
   id: string;
   card: ApprovalCard;
   decision?: string;
   onDecision: (id: string, action: "allow" | "deny" | "always" | "edit", text?: string) => void;
+  active?: boolean;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(card.editable ?? "");
   useEffect(() => setDraft(card.editable ?? ""), [card.editable]);
+  useEffect(() => {
+    if (!active || decision) return;
+    const handler = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
+      const target = event.target as HTMLElement | null;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) {
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onDecision(id, "deny");
+      } else if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        onDecision(id, "allow");
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [active, decision, id, onDecision]);
   if (decision) return null;
   return (
     <div className="approvalCard">
@@ -434,7 +538,7 @@ function ApprovalView({
       ) : (
         <div className="approvalActions">
           <button type="button" className="allow" onClick={() => onDecision(id, "allow")}>Allow</button>
-          <button type="button" onClick={() => onDecision(id, "always")}>Always</button>
+          <button type="button" title="Allow this exact call for the rest of the session" onClick={() => onDecision(id, "always")}>Always</button>
           {card.editable ? <button type="button" onClick={() => { setDraft(card.editable ?? ""); setEditing(true); }}>Edit</button> : null}
           <button type="button" className="deny" onClick={() => onDecision(id, "deny")}>Deny</button>
         </div>

@@ -13,6 +13,7 @@ module;
 #include <map>
 #include <optional>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -36,6 +37,11 @@ export namespace sparsity::session {
         std::string title;
         int messages{0};
         double updated{0.0};
+    };
+
+    struct Limits {
+        std::optional<int> max_steps;
+        std::optional<double> max_turn_cost;
     };
 
     struct Projection {
@@ -65,6 +71,13 @@ export namespace sparsity::session {
         llm::Usage last_usage() const;
 
         void add_user(const std::string &text, const json_type &attachments = json_type::array());
+        void add_context(const std::string &text);
+        std::string permission() const;
+        void add_permission(const std::string &mode);
+        Limits limits() const;
+        void add_limits(int max_steps, double max_turn_cost);
+        std::set<std::string> allow_rules() const;
+        void add_allow_rule(const std::string &rule);
         void add_assistant(const llm::AssistantMessage &message);
         void add_tool_result(const std::string &tool_use_id, const json_type &content, bool is_error);
         void add_switch(const std::string &model, const std::string &effort);
@@ -136,7 +149,8 @@ namespace sparsity::session {
 
     bool metadata(const std::string &type) {
         return type == "cwd" || type == "abort" || type == "switch" || type == "todos" ||
-               type == "title" || type == "prune";
+               type == "title" || type == "prune" || type == "permission" || type == "allow" ||
+               type == "limits";
     }
 
     int seq_of(const json_type &event) {
@@ -339,6 +353,59 @@ export namespace sparsity::session {
         append("user", {{"content", std::move(content)}});
     }
 
+    void Session::add_context(const std::string &text) {
+        if (text.empty()) return;
+        append("context", {{"text", text}});
+    }
+
+    std::string Session::permission() const {
+        for (auto event = events_.rbegin(); event != events_.rend(); ++event) {
+            if (event->value("type", std::string{}) == "permission") {
+                return event->value("mode", std::string{});
+            }
+        }
+        return {};
+    }
+
+    void Session::add_permission(const std::string &mode) {
+        if (mode.empty()) return;
+        append("permission", {{"mode", mode}});
+    }
+
+    Limits Session::limits() const {
+        Limits result;
+        for (auto event = events_.rbegin(); event != events_.rend(); ++event) {
+            if (event->value("type", std::string{}) != "limits") continue;
+            if (event->contains("max_steps") && (*event)["max_steps"].is_number_integer()) {
+                result.max_steps = (*event)["max_steps"].get<int>();
+            }
+            if (event->contains("max_turn_cost") && (*event)["max_turn_cost"].is_number()) {
+                result.max_turn_cost = (*event)["max_turn_cost"].get<double>();
+            }
+            break;
+        }
+        return result;
+    }
+
+    void Session::add_limits(const int max_steps, const double max_turn_cost) {
+        append("limits", {{"max_steps", max_steps}, {"max_turn_cost", max_turn_cost}});
+    }
+
+    std::set<std::string> Session::allow_rules() const {
+        std::set<std::string> rules;
+        for (const auto &event: events_) {
+            if (event.value("type", std::string{}) != "allow") continue;
+            const auto rule = event.value("rule", std::string{});
+            if (!rule.empty()) rules.insert(rule);
+        }
+        return rules;
+    }
+
+    void Session::add_allow_rule(const std::string &rule) {
+        if (rule.empty()) return;
+        append("allow", {{"rule", rule}});
+    }
+
     void Session::add_assistant(const llm::AssistantMessage &message) {
         append("assistant", {
             {"content", message.content},
@@ -439,6 +506,19 @@ export namespace sparsity::session {
         while (index < body.size()) {
             const auto &event = *body[index];
             const auto type = event.value("type", std::string{});
+            if (type == "context") {
+                const auto text = event.value("text", std::string{});
+                if (!text.empty()) {
+                    const auto seq = seq_of(event);
+                    messages.push_back({
+                        {"role", "user"},
+                        {"content", json_type::array({{{"type", "text"}, {"text", text}}})},
+                    });
+                    sources.emplace_back(seq, seq);
+                }
+                ++index;
+                continue;
+            }
             if (type == "user") {
                 const auto content = event.value("content", json_type::array());
                 if (!content.empty()) {

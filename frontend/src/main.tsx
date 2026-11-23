@@ -120,6 +120,8 @@ export function App() {
   liveRef.current = liveTurns;
   const [chatStatuses, setChatStatuses] = useState<Record<string, ChatStatus>>({});
   const [chatStats, setChatStats] = useState<Record<string, ChatStats>>({});
+  const [chatPermissions, setChatPermissions] = useState<Record<string, string>>({});
+  const [chatLimits, setChatLimits] = useState<Record<string, ChatLimits>>({});
   const [todosByProject, setTodosByProject] = useState<Record<string, TodoItem[]>>({});
   const [attachmentsByProject, setAttachmentsByProject] = useState<Record<string, UploadAttachment[]>>({});
   const [models, setModels] = useState<ModelInfo[]>([]);
@@ -129,6 +131,7 @@ export function App() {
   const [effort, setEffort] = useState(defaultEffort);
   const effortRef = useRef(effort);
   effortRef.current = effort;
+  const permissionsRef = useRef("workspace");
   const [splitMode, setSplitMode] = useState<SplitMode>("split");
   const [terminalVisible, setTerminalVisible] = useState(false);
   const [paletteMode, setPaletteMode] = useState<PaletteMode | null>(null);
@@ -158,6 +161,9 @@ export function App() {
   const activeLive = activeProjectId ? liveTurns[activeProjectId] ?? null : null;
   const activeStatus: ChatStatus = activeProjectId ? chatStatuses[activeProjectId] ?? "idle" : "idle";
   const activeStats = activeProjectId ? chatStats[activeProjectId] ?? emptyStats() : emptyStats();
+  const activePermissions = activeProjectId ? chatPermissions[activeProjectId] ?? "workspace" : "workspace";
+  permissionsRef.current = activePermissions;
+  const activeLimits = activeProjectId ? chatLimits[activeProjectId] ?? { maxSteps: 0, maxTurnCost: 1 } : { maxSteps: 0, maxTurnCost: 1 };
   const activeTodos = activeProjectId ? todosByProject[activeProjectId] ?? [] : [];
   const activeAttachments = activeProjectId ? attachmentsByProject[activeProjectId] ?? [] : [];
   const dirtyProjectIds = useMemo(() => new Set(
@@ -351,6 +357,9 @@ export function App() {
             setEffort(message.effort);
             effortRef.current = message.effort;
           }
+          if (typeof message.permissions === "string" && message.permissions) {
+            setChatPermissions((current) => ({ ...current, [projectId]: message.permissions as string }));
+          }
           break;
         case "history": {
           const events = (message.events as ChatEvent[]) ?? [];
@@ -411,6 +420,88 @@ export function App() {
               : tool)
           }));
           break;
+        case "step": {
+          const calls = (message.tool_calls as ToolCall[] | undefined) ?? [];
+          const text = String(message.text ?? "");
+          const thinking = String(message.thinking ?? "");
+          if (text || thinking || calls.length > 0) {
+            setChats((current) => ({
+              ...current,
+              [projectId]: [
+                ...(current[projectId] ?? []),
+                {
+                  kind: "assistant",
+                  id: nextChatId(),
+                  thinking,
+                  text,
+                  tools: calls,
+                  usage: message.usage as Usage | undefined,
+                  stopReason: typeof message.stop_reason === "string" ? message.stop_reason : undefined
+                }
+              ]
+            }));
+          }
+          const nextLive = { ...liveRef.current };
+          delete nextLive[projectId];
+          liveRef.current = nextLive;
+          setLiveTurns(nextLive);
+          break;
+        }
+        case "notice":
+          setChats((current) => ({
+            ...current,
+            [projectId]: [
+              ...(current[projectId] ?? []),
+              {
+                kind: "notice",
+                id: nextChatId(),
+                message: String(message.message ?? ""),
+                action: typeof message.prompt === "string"
+                  ? {
+                      label: typeof message.label === "string" ? message.label : "Continue",
+                      prompt: message.prompt
+                    }
+                  : undefined
+              }
+            ]
+          }));
+          break;
+        case "loop":
+          setChats((current) => ({
+            ...current,
+            [projectId]: [
+              ...(current[projectId] ?? []),
+              {
+                kind: "loop",
+                id: nextChatId(),
+                message: String(message.message ?? ""),
+                tool: typeof message.tool === "string" ? message.tool : undefined,
+                count: typeof message.count === "number" ? message.count : undefined,
+                summary: typeof message.summary === "string" ? message.summary : undefined,
+                level: typeof message.level === "number" ? message.level : 3
+              }
+            ]
+          }));
+          break;
+        case "loop_check":
+          setChats((current) => ({
+            ...current,
+            [projectId]: [
+              ...(current[projectId] ?? []),
+              {
+                kind: "loop",
+                id: nextChatId(),
+                message: String(message.message ?? ""),
+                tool: typeof message.tool === "string" ? message.tool : undefined,
+                count: typeof message.count === "number" ? message.count : undefined,
+                summary: typeof message.summary === "string" ? message.summary : undefined,
+                checkId: String(message.id ?? ""),
+                level: typeof message.level === "number" ? message.level : (typeof message.count === "number" ? message.count : 5)
+              }
+            ]
+          }));
+          setProjectStatus("approval");
+          break;
         case "approval":
           patchLive((live) => ({
             ...live,
@@ -445,13 +536,34 @@ export function App() {
             ...current,
             [projectId]: {
               cost: Number(message.cost ?? 0),
+              turnCost: Number(message.turn_cost ?? 0),
               ctx: Number(message.ctx_tokens ?? 0),
               cacheRead: Number(message.cache_read_input_tokens ?? 0),
               cacheCreation: Number(message.cache_creation_input_tokens ?? 0),
               input: Number(message.input_tokens ?? 0)
             }
           }));
-          setProjectStatus(message.busy === true ? "busy" : "idle");
+          if (typeof message.permissions === "string" && message.permissions) {
+            setChatPermissions((current) => ({ ...current, [projectId]: message.permissions as string }));
+          }
+          if (typeof message.max_steps === "number" || typeof message.max_turn_cost === "number") {
+            setChatLimits((current) => ({
+              ...current,
+              [projectId]: {
+                maxSteps: typeof message.max_steps === "number"
+                  ? message.max_steps
+                  : current[projectId]?.maxSteps ?? 0,
+                maxTurnCost: typeof message.max_turn_cost === "number"
+                  ? message.max_turn_cost
+                  : current[projectId]?.maxTurnCost ?? 1
+              }
+            }));
+          }
+          setChatStatuses((current) => {
+            const value = current[projectId];
+            if (value === "streaming" || value === "approval") return current;
+            return { ...current, [projectId]: message.busy === true ? "busy" : "idle" };
+          });
           break;
         case "compaction":
           setChats((current) => ({
@@ -705,6 +817,8 @@ export function App() {
     setLiveTurns((current) => withoutKey(current, projectId));
     setChatStatuses((current) => withoutKey(current, projectId));
     setChatStats((current) => withoutKey(current, projectId));
+    setChatPermissions((current) => withoutKey(current, projectId));
+    setChatLimits((current) => withoutKey(current, projectId));
     setTodosByProject((current) => withoutKey(current, projectId));
     setAttachmentsByProject((current) => withoutKey(current, projectId));
     if (activeProjectId === projectId) {
@@ -823,6 +937,8 @@ export function App() {
         setLiveTurns((current) => withoutKeys(current, ids));
         setChatStatuses((current) => withoutKeys(current, ids));
         setChatStats((current) => withoutKeys(current, ids));
+        setChatPermissions((current) => withoutKeys(current, ids));
+        setChatLimits((current) => withoutKeys(current, ids));
         setTodosByProject((current) => withoutKeys(current, ids));
         setAttachmentsByProject((current) => withoutKeys(current, ids));
         if (activeProjectId && ids.has(activeProjectId)) setActiveProjectId(remaining[0]?.id ?? null);
@@ -993,7 +1109,12 @@ export function App() {
   function sendSettings() {
     const socket = agentSocket.current;
     if (socket?.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type: "settings", model: modelRef.current, effort: effortRef.current }));
+      socket.send(JSON.stringify({
+        type: "settings",
+        model: modelRef.current,
+        effort: effortRef.current,
+        permissions: permissionsRef.current
+      }));
     }
   }
 
@@ -1014,6 +1135,30 @@ export function App() {
     setEffort(value);
     effortRef.current = value;
     sendSettings();
+  }
+
+  function changePermissions(value: string) {
+    const projectId = activeProjectId;
+    if (!projectId) return;
+    if (value === "auto" &&
+        !window.confirm("Auto-approve every tool call, including shell commands? Only use this in a trusted container.")) {
+      return;
+    }
+    setChatPermissions((current) => ({ ...current, [projectId]: value }));
+    permissionsRef.current = value;
+    sendSettings();
+  }
+
+  function changeLimits(maxSteps: number, maxTurnCost: number) {
+    const projectId = activeProjectId;
+    if (!projectId) return;
+    const steps = Math.max(0, Math.trunc(Number.isFinite(maxSteps) ? maxSteps : 0));
+    const cost = Math.max(0, Number.isFinite(maxTurnCost) ? maxTurnCost : 0);
+    setChatLimits((current) => ({ ...current, [projectId]: { maxSteps: steps, maxTurnCost: cost } }));
+    const socket = agentSocket.current;
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "settings", max_steps: steps, max_turn_cost: cost }));
+    }
   }
 
   async function upload(projectId: string, file: File) {
@@ -1068,6 +1213,20 @@ export function App() {
     });
     setChatStatuses((current) => ({ ...current, [projectId]: "streaming" }));
     socket.send(JSON.stringify({ type: "decision", id, action, text }));
+  }
+
+  function decideLoop(checkId: string, action: "continue" | "stop") {
+    const projectId = activeProjectId;
+    const socket = agentSocket.current;
+    if (!projectId || !socket || socket.readyState !== WebSocket.OPEN) return;
+    setChats((current) => ({
+      ...current,
+      [projectId]: (current[projectId] ?? []).map((item) =>
+        item.kind === "loop" && item.checkId === checkId ? { ...item, decision: action } : item
+      )
+    }));
+    setChatStatuses((current) => ({ ...current, [projectId]: "streaming" }));
+    socket.send(JSON.stringify({ type: "loop_decision", id: checkId, action }));
   }
 
   function interrupt() {
@@ -1162,6 +1321,10 @@ export function App() {
                   models={models}
                   model={model}
                   effort={effort}
+                  permissions={activePermissions}
+                  maxSteps={activeLimits.maxSteps}
+                  maxTurnCost={activeLimits.maxTurnCost}
+                  turnCost={activeStats.turnCost}
                   sessions={activeSessionList}
                   activeSessionId={activeSessionId}
                   attachments={activeAttachments}
@@ -1176,6 +1339,9 @@ export function App() {
                   }))}
                   onModelChange={changeModel}
                   onEffortChange={changeEffort}
+                  onPermissionsChange={changePermissions}
+                  onLimitsChange={changeLimits}
+                  onLoopDecision={decideLoop}
                   items={activeItems}
                   live={activeLive}
                   todos={activeTodos}
@@ -1227,8 +1393,14 @@ function emptyLive(): LiveTurn {
   return { thinking: "", text: "", tools: [] };
 }
 
+type ChatLimits = {
+  maxSteps: number;
+  maxTurnCost: number;
+};
+
 type ChatStats = {
   cost: number;
+  turnCost: number;
   ctx: number;
   cacheRead: number;
   cacheCreation: number;
@@ -1236,7 +1408,7 @@ type ChatStats = {
 };
 
 function emptyStats(): ChatStats {
-  return { cost: 0, ctx: 0, cacheRead: 0, cacheCreation: 0, input: 0 };
+  return { cost: 0, turnCost: 0, ctx: 0, cacheRead: 0, cacheCreation: 0, input: 0 };
 }
 
 function historyToChatItems(events: ChatEvent[]): ChatItem[] {

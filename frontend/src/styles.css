@@ -703,6 +703,9 @@ kbd {
 .noticeMarker { display: flex; align-items: center; justify-content: center; gap: 8px; }
 .noticeMarker button { border: 1px solid #c9ccd6; border-radius: 4px; background: #ffffff; color: #3c3f41; padding: 2px 8px; font-size: 10px; cursor: pointer; }
 .noticeMarker button:hover { background: #e8f0fe; }
+.noticeMarker.notice-quota { justify-content: flex-start; padding: 8px 10px; border: 1px solid #e8c98a; border-radius: 6px; background: #fffaf0; color: #8a5a1f; font-size: 11px; text-align: left; }
+.noticeMarker.notice-quota button { flex: 0 0 auto; border-color: #c98a2e; background: #c98a2e; color: #ffffff; }
+.noticeMarker.notice-quota button:hover { border-color: #b0761f; background: #b0761f; }
 .chatError { margin: 9px 0; padding: 7px 9px; border-radius: 4px; background: #c05a5a14; color: #c05a5a; font-size: 12px; }
 .typingDots { color: #5b7db1; }
 .chatTimeline::-webkit-scrollbar, .projectList::-webkit-scrollbar, .treeScroll::-webkit-scrollbar { width: 8px; height: 8px; }

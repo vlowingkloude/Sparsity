@@ -388,7 +388,7 @@ function ChatItemView({ item, onSend, onLoopDecision }: { item: ChatItem; onSend
   }
   if (item.kind === "notice") {
     return (
-      <div className="chatMarker noticeMarker">
+      <div className={`chatMarker noticeMarker${item.noticeKind ? ` notice-${item.noticeKind}` : ""}`}>
         <span>{item.message}</span>
         {item.action ? (
           <button type="button" onClick={() => onSend(item.action!.prompt)}>
@@ -434,7 +434,7 @@ function LiveView({
 
 function ThinkingBlock({ text, streaming }: { text: string; streaming?: boolean }) {
   return (
-    <details className="thinkingBlock" open={Boolean(streaming)}>
+    <details className="thinkingBlock">
       <summary>
         <Sparkles size={13} /> {streaming ? "Thinking…" : "Thinking"}
       </summary>

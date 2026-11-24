@@ -351,6 +351,23 @@ export namespace sparsity::agent {
             }
         };
 
+        // An out-of-balance account is user-actionable: show a bubble with a
+        // Continue action instead of a dead-end error, so the turn can resume
+        // after the user tops up.
+        auto send_llm_error = [&send](const llm::Error &error) {
+            if (error.kind == "quota") {
+                send({
+                    {"type", "notice"},
+                    {"kind", "quota"},
+                    {"message", "DeepSeek account balance is insufficient. Top up your account, then click Continue to resume."},
+                    {"prompt", "continue"},
+                    {"label", "Continue"},
+                });
+                return;
+            }
+            send({{"type", "error"}, {"kind", error.kind}, {"message", error.what()}});
+        };
+
         session::Store store(context.home);
         auto session = session_id.empty() ? store.latest(context.project_id)
                                           : store.load(context.project_id, session_id);
@@ -808,7 +825,7 @@ export namespace sparsity::agent {
                             finish("aborted");
                             return;
                         }
-                        send({{"type", "error"}, {"kind", error.kind}, {"message", error.what()}});
+                        send_llm_error(error);
                         finish("error");
                         return;
                     } catch (const std::exception &error) {
@@ -928,7 +945,7 @@ export namespace sparsity::agent {
                             finish("aborted");
                             return;
                         }
-                        send({{"type", "error"}, {"kind", error.kind}, {"message", error.what()}});
+                        send_llm_error(error);
                         finish("error");
                         return;
                     } catch (const std::exception &error) {
@@ -1162,7 +1179,7 @@ export namespace sparsity::agent {
                     std::lock_guard lock(state.mutex);
                     if (state.cancel == token) state.cancel.reset();
                 }
-                send({{"type", "error"}, {"kind", error.kind}, {"message", error.what()}});
+                send_llm_error(error);
             } catch (const std::exception &error) {
                 {
                     std::lock_guard lock(state.mutex);

@@ -456,6 +456,7 @@ export function App() {
                 kind: "notice",
                 id: nextChatId(),
                 message: String(message.message ?? ""),
+                noticeKind: typeof message.kind === "string" ? message.kind : undefined,
                 action: typeof message.prompt === "string"
                   ? {
                       label: typeof message.label === "string" ? message.label : "Continue",

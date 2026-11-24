@@ -159,7 +159,7 @@ export type ChatItem =
   | { kind: "tool"; id: string; call: ToolCall }
   | { kind: "approval"; id: string; call: ToolCall; card: ApprovalCard; decision?: string }
   | { kind: "compaction"; id: string; summary: string; before: number; after: number; hardTrimmed?: boolean }
-  | { kind: "notice"; id: string; message: string; action?: { label: string; prompt: string } }
+  | { kind: "notice"; id: string; message: string; noticeKind?: string; action?: { label: string; prompt: string } }
   | { kind: "loop"; id: string; message: string; tool?: string; count?: number; summary?: string; level?: number; checkId?: string; decision?: "continue" | "stop" }
   | { kind: "error"; id: string; message: string };
 

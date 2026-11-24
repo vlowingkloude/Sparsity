@@ -13,6 +13,7 @@ target_link_libraries(
         PUBLIC
         json
         llm
+        pricing
         config
         http
         images

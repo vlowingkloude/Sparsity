@@ -32,6 +32,11 @@ export namespace sparsity::config {
         int fetch_max_chars{30000};
     };
 
+    struct Images {
+        int max_request_images{500};
+        int max_request_bytes{40 * 1024 * 1024};
+    };
+
     struct Compaction {
         int context_window{1'048'576};
         double threshold_ratio{0.80};
@@ -53,6 +58,7 @@ export namespace sparsity::config {
         Permissions permissions;
         Tools tools;
         Web web;
+        Images images;
         Compaction compaction;
         std::filesystem::path home;
     };
@@ -184,6 +190,19 @@ export namespace sparsity::config {
         if (global_web != nullptr) apply_web(*global_web);
         if (local_web != nullptr) apply_web(*local_web);
 
+        const auto *global_images = global["images"].as_table();
+        const auto *local_images = local["images"].as_table();
+        const auto apply_images = [&result](const toml::table &data) {
+            if (const auto value = data["max_request_images"].value<int>()) {
+                result.images.max_request_images = *value;
+            }
+            if (const auto value = data["max_request_bytes"].value<int>()) {
+                result.images.max_request_bytes = *value;
+            }
+        };
+        if (global_images != nullptr) apply_images(*global_images);
+        if (local_images != nullptr) apply_images(*local_images);
+
         const auto *global_compaction = global["compaction"].as_table();
         const auto *local_compaction = local["compaction"].as_table();
         const auto apply = [&result](const toml::table &data) {
@@ -218,10 +237,22 @@ export namespace sparsity::config {
         }
         if (result.compaction.context_window < 4096) throw std::runtime_error("compaction.context_window is too small");
         if (result.compaction.headroom_tokens < 0) throw std::runtime_error("compaction.headroom_tokens must not be negative");
+        if (result.compaction.context_window <=
+            result.max_output_tokens + result.compaction.headroom_tokens) {
+            throw std::runtime_error(
+                "compaction.context_window must exceed max_output_tokens + headroom_tokens");
+        }
         if (result.compaction.prune_tool_chars < 512) throw std::runtime_error("compaction.prune_tool_chars is too small");
         if (result.compaction.max_summary_tokens < 512) throw std::runtime_error("compaction.max_summary_tokens is too small");
         if (result.web.search_count < 1 || result.web.search_count > 50) throw std::runtime_error("web.search_count must be 1..50");
         if (result.web.fetch_max_chars < 1024) throw std::runtime_error("web.fetch_max_chars is too small");
+        if (result.images.max_request_images < 1 || result.images.max_request_images > 600) {
+            throw std::runtime_error("images.max_request_images must be 1..600");
+        }
+        if (result.images.max_request_bytes < 1024 * 1024 ||
+            result.images.max_request_bytes > 48 * 1024 * 1024) {
+            throw std::runtime_error("images.max_request_bytes must be 1..48 MiB");
+        }
         return result;
     }
 

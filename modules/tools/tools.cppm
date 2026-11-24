@@ -39,6 +39,7 @@ import llm;
 import config;
 import http;
 import images;
+import pricing;
 
 export namespace sparsity::tools {
 
@@ -107,6 +108,8 @@ export namespace sparsity::tools {
 
         json_type search(const std::string &query, int count);
         json_type fetch(const std::string &url);
+        // Successful Search/Fetch requests bill per call; cache hits do not.
+        double cost() const;
 
     private:
         json_type post(const std::string &path, const json_type &body);
@@ -114,7 +117,8 @@ export namespace sparsity::tools {
         std::string base_;
         std::string api_key_;
         std::map<std::string, json_type> cache_;
-        std::mutex mutex_;
+        mutable std::mutex mutex_;
+        double cost_{0.0};
     };
 
     struct ToolContext {
@@ -768,6 +772,7 @@ export namespace sparsity::tools {
         std::lock_guard lock(mutex_);
         if (cache_.size() >= 32) cache_.erase(cache_.begin());
         cache_[key] = value;
+        cost_ += pricing::web_call_cost(1);
         return value;
     }
 
@@ -781,7 +786,13 @@ export namespace sparsity::tools {
         std::lock_guard lock(mutex_);
         if (cache_.size() >= 32) cache_.erase(cache_.begin());
         cache_[key] = value;
+        cost_ += pricing::web_call_cost(1);
         return value;
+    }
+
+    double WebClient::cost() const {
+        std::lock_guard lock(mutex_);
+        return cost_;
     }
 
     std::vector<Tool> make_tools() {

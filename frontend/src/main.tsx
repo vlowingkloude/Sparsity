@@ -575,7 +575,8 @@ export function App() {
                 id: nextChatId(),
                 summary: String(message.summary ?? ""),
                 before: Number(message.before_tokens ?? 0),
-                after: Number(message.after_tokens ?? 0)
+                after: Number(message.after_tokens ?? 0),
+                hardTrimmed: message.hard_trimmed === true
               }
             ]
           }));
@@ -1433,7 +1434,8 @@ function historyToChatItems(events: ChatEvent[]): ChatItem[] {
         id: `history-${items.length}`,
         summary: event.summary,
         before: event.before_tokens,
-        after: event.after_tokens
+        after: event.after_tokens,
+        hardTrimmed: event.hard_trimmed === true
       });
     }
   }

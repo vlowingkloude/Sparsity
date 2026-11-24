@@ -7,6 +7,9 @@ target_link_libraries(
         json
         lsp
         session
+        pricing
+        compaction
+        config
 )
 
 add_test(NAME sparsity_tests COMMAND sparsity_tests)

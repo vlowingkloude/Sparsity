@@ -366,6 +366,7 @@ function ChatItemView({ item, onSend, onLoopDecision }: { item: ChatItem; onSend
     return (
       <div className="chatMarker">
         <FileText size={13} /> Compacted {formatTokens(item.before)} → {formatTokens(item.after)}
+        {item.hardTrimmed ? " (hard trimmed)" : ""}
       </div>
     );
   }

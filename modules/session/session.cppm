@@ -49,6 +49,18 @@ export namespace sparsity::session {
         std::vector<std::pair<int, int>> sources;
     };
 
+    struct ImageOccurrence {
+        int seq{0};
+        int index{0};
+        std::size_t bytes{0};
+        bool offloaded{false};
+    };
+
+    struct InstructionState {
+        std::string hash;
+        std::string mode;
+    };
+
     json_type now_iso();
     std::string new_session_id();
 
@@ -69,25 +81,35 @@ export namespace sparsity::session {
         int message_count() const;
         double cost() const;
         llm::Usage last_usage() const;
+        std::string system_prompt() const;
+        std::string instructions_hash() const;
+        InstructionState instruction_state() const;
 
         void add_user(const std::string &text, const json_type &attachments = json_type::array());
         void add_context(const std::string &text);
+        void add_system_prompt(const std::string &text, const std::string &instructions_hash);
+        void add_system_update(const std::string &text);
+        void add_instruction_state(const std::string &hash, const std::string &mode);
         std::string permission() const;
         void add_permission(const std::string &mode);
         Limits limits() const;
         void add_limits(int max_steps, double max_turn_cost);
         std::set<std::string> allow_rules() const;
         void add_allow_rule(const std::string &rule);
-        void add_assistant(const llm::AssistantMessage &message);
+        double add_assistant(const llm::AssistantMessage &message);
         void add_tool_result(const std::string &tool_use_id, const json_type &content, bool is_error);
         void add_switch(const std::string &model, const std::string &effort);
         void add_cwd(const std::string &path);
         void add_todos(const json_type &items);
         void add_title(const std::string &title);
         void add_abort(const std::string &reason);
-        void add_compaction(const std::string &summary, int keep_from_seq, int through_seq,
-                            int before, int after, const json_type &usage, const std::string &model);
+        double add_compaction(const std::string &summary, int keep_from_seq, int through_seq,
+                              int before, int after, const json_type &usage, const std::string &model,
+                              bool hard_trimmed = false, int dropped_messages = 0);
         void add_prune(int target_seq, const json_type &content);
+        void add_api_cost(const std::string &kind, int count, double cost);
+        void add_image_offload(const json_type &targets);
+        std::vector<ImageOccurrence> image_occurrences() const;
 
         json_type messages() const;
         Projection project_with_sources() const;
@@ -150,7 +172,8 @@ namespace sparsity::session {
     bool metadata(const std::string &type) {
         return type == "cwd" || type == "abort" || type == "switch" || type == "todos" ||
                type == "title" || type == "prune" || type == "permission" || type == "allow" ||
-               type == "limits";
+               type == "limits" || type == "system" || type == "instructions" ||
+               type == "image_offload";
     }
 
     int seq_of(const json_type &event) {
@@ -186,7 +209,33 @@ namespace sparsity::session {
         return result;
     }
 
-    json_type expand_blocks(const json_type &blocks) {
+    std::map<int, std::set<int>> offload_map(const std::vector<json_type> &events) {
+        std::map<int, std::set<int>> result;
+        for (const auto &event: events) {
+            if (event.value("type", std::string{}) != "image_offload") continue;
+            if (!event.contains("targets") || !event["targets"].is_array()) continue;
+            for (const auto &target: event["targets"]) {
+                if (!target.is_object()) continue;
+                const auto seq = target.value("seq", 0);
+                if (!target.contains("indexes") || !target["indexes"].is_array()) continue;
+                for (const auto &index: target["indexes"]) {
+                    if (index.is_number_integer()) result[seq].insert(index.get<int>());
+                }
+            }
+        }
+        return result;
+    }
+
+    json_type offloaded_image(const json_type &block) {
+        const auto path = block.value("path", std::string{});
+        const auto text = path.empty()
+                              ? std::string("[image offloaded]")
+                              : "[image offloaded: " + path + "; use view_image with this path to re-open]";
+        return {{"type", "text"}, {"text", text}};
+    }
+
+    json_type expand_blocks(const json_type &blocks, const int seq,
+                            const std::map<int, std::set<int>> &offloaded, int &image_index) {
         if (!blocks.is_array()) return blocks;
         json_type result = json_type::array();
         for (const auto &block: blocks) {
@@ -195,7 +244,17 @@ namespace sparsity::session {
                 continue;
             }
             const auto type = block.value("type", std::string{});
-            if (type == "image_ref") {
+            if (type == "image_ref" || type == "image") {
+                const auto index = image_index++;
+                const auto found = offloaded.find(seq);
+                if (found != offloaded.end() && found->second.contains(index)) {
+                    result.push_back(offloaded_image(block));
+                    continue;
+                }
+                if (type == "image") {
+                    result.push_back(block);
+                    continue;
+                }
                 const auto path = block.value("path", std::string{});
                 std::ifstream input(path, std::ios::binary);
                 if (!input) {
@@ -216,13 +275,34 @@ namespace sparsity::session {
             }
             if (type == "tool_result") {
                 auto copy = block;
-                copy["content"] = expand_blocks(block.value("content", json_type::array()));
+                copy["content"] = expand_blocks(block.value("content", json_type::array()),
+                                                seq, offloaded, image_index);
                 result.push_back(std::move(copy));
                 continue;
             }
             result.push_back(block);
         }
         return result;
+    }
+
+    void collect_image_sizes(const json_type &blocks, std::vector<std::size_t> &sizes) {
+        if (!blocks.is_array()) return;
+        for (const auto &block: blocks) {
+            if (!block.is_object()) continue;
+            const auto type = block.value("type", std::string{});
+            if (type == "image_ref" || type == "image") {
+                std::size_t bytes = 0;
+                if (block.contains("bytes") && block["bytes"].is_number_unsigned()) {
+                    bytes = block["bytes"].get<std::size_t>();
+                } else if (block.contains("bytes") && block["bytes"].is_number_integer()) {
+                    bytes = static_cast<std::size_t>(
+                        std::max<long long>(0, block["bytes"].get<long long>()));
+                }
+                sizes.push_back(bytes);
+            } else if (type == "tool_result") {
+                collect_image_sizes(block.value("content", json_type::array()), sizes);
+            }
+        }
     }
 
     bool plain_user(const json_type &message) {
@@ -337,10 +417,21 @@ export namespace sparsity::session {
         double total = 0.0;
         for (const auto &event: events_) {
             const auto type = event.value("type", std::string{});
+            if (type == "cost") {
+                if (event.contains("cost") && event["cost"].is_number()) {
+                    total += event["cost"].get<double>();
+                }
+                continue;
+            }
             if (type != "assistant" && type != "compaction") continue;
+            if (event.contains("cost") && event["cost"].is_number()) {
+                total += event["cost"].get<double>();
+                continue;
+            }
+            // Legacy sessions did not persist a quote; price them at the current bucket.
             llm::Usage usage;
             if (event.contains("usage")) usage.update(event["usage"]);
-            total += pricing::estimate_cost(usage, event.value("model", model_));
+            total += pricing::quote(usage, event.value("model", model_)).usd;
         }
         return total;
     }
@@ -356,6 +447,51 @@ export namespace sparsity::session {
     void Session::add_context(const std::string &text) {
         if (text.empty()) return;
         append("context", {{"text", text}});
+    }
+
+    void Session::add_system_prompt(const std::string &text, const std::string &instructions_hash) {
+        append("system", {{"text", text}, {"instructions_hash", instructions_hash}});
+    }
+
+    void Session::add_system_update(const std::string &text) {
+        if (text.empty()) return;
+        append("system_update", {{"text", text}});
+    }
+
+    std::string Session::system_prompt() const {
+        for (auto it = events_.rbegin(); it != events_.rend(); ++it) {
+            if (it->value("type", std::string{}) == "system") {
+                return it->value("text", std::string{});
+            }
+        }
+        return {};
+    }
+
+    std::string Session::instructions_hash() const {
+        for (auto it = events_.rbegin(); it != events_.rend(); ++it) {
+            if (it->value("type", std::string{}) == "system") {
+                return it->value("instructions_hash", std::string{});
+            }
+        }
+        return {};
+    }
+
+    InstructionState Session::instruction_state() const {
+        for (auto it = events_.rbegin(); it != events_.rend(); ++it) {
+            const auto type = it->value("type", std::string{});
+            if (type == "instructions") {
+                return {it->value("hash", std::string{}), it->value("mode", std::string{})};
+            }
+            if (type == "system") {
+                return {it->value("instructions_hash", std::string{}), "system"};
+            }
+        }
+        return {};
+    }
+
+    void Session::add_instruction_state(const std::string &hash, const std::string &mode) {
+        if (hash.empty()) return;
+        append("instructions", {{"hash", hash}, {"mode", mode}});
     }
 
     std::string Session::permission() const {
@@ -406,14 +542,21 @@ export namespace sparsity::session {
         append("allow", {{"rule", rule}});
     }
 
-    void Session::add_assistant(const llm::AssistantMessage &message) {
+    double Session::add_assistant(const llm::AssistantMessage &message) {
+        const auto model = message.model.empty() ? model_ : message.model;
+        const auto quoted = pricing::quote(message.usage, model);
         append("assistant", {
             {"content", message.content},
             {"stop_reason", message.stop_reason.value_or("")},
             {"usage", message.usage.to_json()},
-            {"model", message.model.empty() ? model_ : message.model},
+            {"model", model},
             {"interrupted", message.interrupted},
+            {"cost", quoted.usd},
+            {"cost_known", quoted.known},
+            {"price_bucket", quoted.bucket},
+            {"prices_version", quoted.version},
         });
+        return quoted.usd;
     }
 
     void Session::add_tool_result(const std::string &tool_use_id, const json_type &content, const bool is_error) {
@@ -447,9 +590,13 @@ export namespace sparsity::session {
         append("abort", {{"reason", reason}});
     }
 
-    void Session::add_compaction(const std::string &summary, const int keep_from_seq, const int through_seq,
-                                 const int before, const int after, const json_type &usage,
-                                 const std::string &model) {
+    double Session::add_compaction(const std::string &summary, const int keep_from_seq, const int through_seq,
+                                   const int before, const int after, const json_type &usage,
+                                   const std::string &model, const bool hard_trimmed,
+                                   const int dropped_messages) {
+        llm::Usage parsed;
+        parsed.update(usage);
+        const auto quoted = pricing::quote(parsed, model.empty() ? model_ : model);
         append("compaction", {
             {"summary", summary},
             {"keep_from_seq", keep_from_seq},
@@ -458,11 +605,63 @@ export namespace sparsity::session {
             {"after", after},
             {"usage", usage},
             {"model", model},
+            {"cost", quoted.usd},
+            {"cost_known", quoted.known},
+            {"price_bucket", quoted.bucket},
+            {"prices_version", quoted.version},
+            {"hard_trimmed", hard_trimmed},
+            {"dropped_messages", dropped_messages},
         });
+        return quoted.usd;
     }
 
     void Session::add_prune(const int target_seq, const json_type &content) {
         append("prune", {{"target_seq", target_seq}, {"content", content}});
+    }
+
+    void Session::add_api_cost(const std::string &kind, const int count, const double cost) {
+        if (count <= 0 || cost <= 0.0) return;
+        append("cost", {
+            {"kind", kind},
+            {"count", count},
+            {"cost", cost},
+            {"prices_version", pricing::prices_version()},
+        });
+    }
+
+    void Session::add_image_offload(const json_type &targets) {
+        if (!targets.is_array() || targets.empty()) return;
+        append("image_offload", {{"targets", targets}});
+    }
+
+    std::vector<ImageOccurrence> Session::image_occurrences() const {
+        const auto offloaded = offload_map(events_);
+        int keep_from = 0;
+        for (auto it = events_.rbegin(); it != events_.rend(); ++it) {
+            if (it->value("type", std::string{}) == "compaction") {
+                keep_from = it->value("keep_from_seq", 0);
+                break;
+            }
+        }
+        std::vector<ImageOccurrence> result;
+        for (const auto &event: events_) {
+            const auto type = event.value("type", std::string{});
+            if (type != "user" && type != "tool_result") continue;
+            const auto seq = seq_of(event);
+            if (seq < keep_from) continue;
+            std::vector<std::size_t> sizes;
+            collect_image_sizes(event.value("content", json_type::array()), sizes);
+            const auto found = offloaded.find(seq);
+            for (std::size_t index = 0; index < sizes.size(); ++index) {
+                result.push_back({
+                    seq,
+                    static_cast<int>(index),
+                    sizes[index],
+                    found != offloaded.end() && found->second.contains(static_cast<int>(index)),
+                });
+            }
+        }
+        return result;
     }
 
     json_type Session::messages() const {
@@ -477,6 +676,7 @@ export namespace sparsity::session {
                 prune[event["target_seq"].get<int>()] = event.value("content", json_type::array());
             }
         }
+        const auto offloaded = offload_map(events_);
 
         const json_type *compaction = nullptr;
         for (auto it = events_.rbegin(); it != events_.rend(); ++it) {
@@ -506,6 +706,19 @@ export namespace sparsity::session {
         while (index < body.size()) {
             const auto &event = *body[index];
             const auto type = event.value("type", std::string{});
+            if (type == "system_update") {
+                const auto text = event.value("text", std::string{});
+                if (!text.empty()) {
+                    const auto seq = seq_of(event);
+                    messages.push_back({
+                        {"role", "system"},
+                        {"content", json_type::array({{{"type", "text"}, {"text", text}}})},
+                    });
+                    sources.emplace_back(seq, seq);
+                }
+                ++index;
+                continue;
+            }
             if (type == "context") {
                 const auto text = event.value("text", std::string{});
                 if (!text.empty()) {
@@ -523,12 +736,14 @@ export namespace sparsity::session {
                 const auto content = event.value("content", json_type::array());
                 if (!content.empty()) {
                     const auto seq = seq_of(event);
+                    int image_index = 0;
+                    auto expanded = expand_blocks(content, seq, offloaded, image_index);
                     if (!messages.empty() && messages.back().value("role", std::string{}) == "user" &&
                         plain_user(messages.back())) {
-                        for (const auto &block: content) messages.back()["content"].push_back(block);
+                        for (const auto &block: expanded) messages.back()["content"].push_back(block);
                         sources.back().second = seq;
                     } else {
-                        messages.push_back({{"role", "user"}, {"content", expand_blocks(content)}});
+                        messages.push_back({{"role", "user"}, {"content", std::move(expanded)}});
                         sources.emplace_back(seq, seq);
                     }
                 }
@@ -558,10 +773,11 @@ export namespace sparsity::session {
                         if (const auto found = prune.find(current_seq); found != prune.end()) {
                             result_content = found->second;
                         }
+                        int image_index = 0;
                         results.push_back({
                             {"type", "tool_result"},
                             {"tool_use_id", next.value("tool_use_id", std::string{})},
-                            {"content", expand_blocks(result_content)},
+                            {"content", expand_blocks(result_content, current_seq, offloaded, image_index)},
                             {"is_error", next.value("is_error", false)},
                         });
                         if (first_seq == 0) first_seq = current_seq;

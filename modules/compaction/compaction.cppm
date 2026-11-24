@@ -31,6 +31,10 @@ export namespace sparsity::compaction {
         int after_tokens{0};
         llm::Usage usage;
         std::string model;
+        double cost{0.0};
+        bool hard_trimmed{false};
+        bool fits{true};
+        int dropped_messages{0};
     };
 
     class TokenMeter {
@@ -49,12 +53,16 @@ export namespace sparsity::compaction {
         Compactor(config::Config config, session::Session &session, int window);
 
         TokenMeter &meter() { return meter_; }
+        int limit() const;
+        int hard_limit() const;
+        int system_tools_tokens(const std::string &system, const json_type &tools) const;
         bool should_compact(const json_type &messages) const;
+        bool should_compact(const json_type &messages, const std::string &system,
+                            const json_type &tools) const;
         std::optional<Outcome> compact(llm::Client &client, http::Cancel &cancel,
                                        const std::string &system, const json_type &tools, bool force);
 
     private:
-        int limit() const;
         int retain_budget() const;
         bool prune();
 
@@ -128,6 +136,30 @@ namespace sparsity::compaction {
         "## 目标\n## 已完成\n## 关键决定（含理由）\n## 涉及的文件与命令\n## 待办 / 未决\n"
         "## 重要事实与偏好\n\n"
         "Keep paths, commands, numbers, and names exact. Do not address the user.";
+
+    bool user_has_tool_result(const json_type &message) {
+        if (!message.contains("content") || !message["content"].is_array()) return false;
+        for (const auto &block: message["content"]) {
+            if (block.is_object() && block.value("type", std::string{}) == "tool_result") return true;
+        }
+        return false;
+    }
+
+    // Drop one self-contained conversation group from the front of an array.
+    // An assistant message carries its following tool-result user messages.
+    int drop_front_group(json_type &messages, const int start) {
+        if (!messages.is_array() || start < 0 || start >= static_cast<int>(messages.size())) return 0;
+        int end = start + 1;
+        if (messages[start].value("role", std::string{}) == "assistant") {
+            while (end < static_cast<int>(messages.size()) &&
+                   messages[end].value("role", std::string{}) == "user" &&
+                   user_has_tool_result(messages[end])) {
+                ++end;
+            }
+        }
+        messages.erase(messages.begin() + start, messages.begin() + end);
+        return end - start;
+    }
 
 }
 
@@ -204,8 +236,16 @@ export namespace sparsity::compaction {
 
     int Compactor::limit() const {
         const auto by_ratio = static_cast<int>(static_cast<double>(window_) * config_.compaction.threshold_ratio);
-        const auto by_headroom = window_ - config_.max_output_tokens - config_.compaction.headroom_tokens;
+        const auto by_headroom = hard_limit();
         return std::min(by_ratio, by_headroom);
+    }
+
+    int Compactor::hard_limit() const {
+        return window_ - config_.max_output_tokens - config_.compaction.headroom_tokens;
+    }
+
+    int Compactor::system_tools_tokens(const std::string &system, const json_type &tools) const {
+        return static_cast<int>(meter_.estimate_text(system) + meter_.estimate_text(tools.dump()));
     }
 
     int Compactor::retain_budget() const {
@@ -216,6 +256,13 @@ export namespace sparsity::compaction {
         if (!config_.compaction.auto_compact) return false;
         if (messages.size() < 4) return false;
         return meter_.estimate_messages(messages) >= limit();
+    }
+
+    bool Compactor::should_compact(const json_type &messages, const std::string &system,
+                                   const json_type &tools) const {
+        if (!config_.compaction.auto_compact) return false;
+        if (messages.size() < 4) return false;
+        return meter_.estimate_messages(messages) + system_tools_tokens(system, tools) >= limit();
     }
 
     bool Compactor::prune() {
@@ -262,26 +309,42 @@ export namespace sparsity::compaction {
                                               const bool force) {
         auto projection = session_.project_with_sources();
         const auto before = meter_.estimate_messages(projection.messages);
-        if (!force && before < limit()) return std::nullopt;
+        const auto system_tools = system_tools_tokens(system, tools);
+        if (!force && before + system_tools < limit()) return std::nullopt;
 
-        const auto pruned = prune();
-        int after_prune = before;
-        if (pruned) {
-            projection = session_.project_with_sources();
-            after_prune = meter_.estimate_messages(projection.messages);
-            if (!force && after_prune < limit()) {
-                return Outcome{"", 0, 0, before, after_prune, {}, session_.model()};
-            }
-        }
+        // Do not prune if there is no safe cut point: that would invalidate
+        // the provider prefix without producing a usable summary.
+        if (choose_boundary(projection.messages, retain_budget(), meter_) < 0) return std::nullopt;
+
+        // Pruning rewrites earlier tool results and invalidates the provider
+        // prefix from that point. Only do it as part of a full compaction so
+        // the conversation pays for one cache break, not two.
+        if (prune()) projection = session_.project_with_sources();
 
         const auto boundary = choose_boundary(projection.messages, retain_budget(), meter_);
         if (boundary < 0) return std::nullopt;
 
+        // The summary request itself must fit. Drop the oldest complete groups
+        // if a very large early history would otherwise overflow the window.
         json_type head = json_type::array();
         for (int index = 0; index < boundary; ++index) head.push_back(projection.messages[index]);
+        int head_dropped = 0;
+        const int head_budget = std::max(0, window_ - config_.compaction.max_summary_tokens -
+                                               system_tools - 1024);
+        while (meter_.estimate_messages(head) > head_budget && !head.empty()) {
+            const auto dropped = drop_front_group(head, 0);
+            if (dropped == 0) break;
+            head_dropped += dropped;
+        }
+        if (meter_.estimate_messages(head) > head_budget) return std::nullopt;
+
+        std::string instruction = summary_instruction;
+        if (head_dropped > 0) {
+            instruction = "Some of the oldest messages were omitted to fit the context window.\n\n" + instruction;
+        }
         head.push_back({
             {"role", "user"},
-            {"content", json_type::array({{{"type", "text"}, {"text", summary_instruction}}})},
+            {"content", json_type::array({{{"type", "text"}, {"text", instruction}}})},
         });
 
         llm::Request request;
@@ -303,18 +366,35 @@ export namespace sparsity::compaction {
         while (!summary.empty() && std::isspace(static_cast<unsigned char>(summary.back()))) summary.pop_back();
         if (summary.empty()) return std::nullopt;
 
-        const int keep_from_seq = projection.sources[boundary].first;
         const int through_seq = projection.sources[boundary - 1].second;
         json_type tail = json_type::array();
         tail.push_back(summary_message(summary));
         for (int index = boundary; index < static_cast<int>(projection.messages.size()); ++index) {
             tail.push_back(projection.messages[index]);
         }
-        const auto after = meter_.estimate_messages(tail);
-        const auto model = message.model.empty() ? session_.model() : message.model;
-        session_.add_compaction(summary, keep_from_seq, through_seq, before, after,
-                                message.usage.to_json(), model);
-        return Outcome{summary, keep_from_seq, through_seq, before, after, message.usage, model};
-    }
 
+        // Last-resort deterministic trim: the summary already captures the old
+        // head, so drop the oldest retained groups until the next request fits.
+        const int target = limit() - system_tools;
+        int tail_dropped = 0;
+        while (meter_.estimate_messages(tail) > target && tail.size() > 2) {
+            const auto dropped = drop_front_group(tail, 1);
+            if (dropped == 0) break;
+            tail_dropped += dropped;
+        }
+
+        const auto after = meter_.estimate_messages(tail);
+        const bool fits = after + system_tools <= limit();
+        const int body_size = static_cast<int>(projection.messages.size()) - boundary;
+        const int keep_from_seq = tail_dropped >= body_size
+                                      ? through_seq + 1
+                                      : projection.sources[boundary + tail_dropped].first;
+        const auto model = message.model.empty() ? session_.model() : message.model;
+        const auto hard_trimmed = head_dropped > 0 || tail_dropped > 0;
+        const auto cost = session_.add_compaction(summary, keep_from_seq, through_seq, before, after,
+                                                  message.usage.to_json(), model, hard_trimmed,
+                                                  head_dropped + tail_dropped);
+        return Outcome{summary, keep_from_seq, through_seq, before, after, message.usage, model, cost,
+                       hard_trimmed, fits, head_dropped + tail_dropped};
+    }
 }

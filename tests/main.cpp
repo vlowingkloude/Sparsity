@@ -16,6 +16,10 @@ import files;
 import json;
 import lsp;
 import session;
+import llm;
+import pricing;
+import compaction;
+import config;
 
 namespace sparsity::tests {
     using TestFunction = void (*)();
@@ -326,6 +330,135 @@ namespace {
         CHECK(restored->allow_rules().contains("bash:git status"));
         CHECK_EQ(restored->limits().max_steps.value_or(-1), 0);
         CHECK_EQ(restored->limits().max_turn_cost.value_or(-1.0), 1.5);
+    }
+    SPARSITY_TEST(pricing_aliases_and_unknown_models) {
+        namespace pricing = sparsity::pricing;
+        sparsity::llm::Usage usage;
+        usage.input_tokens = 1'000'000;
+
+        const auto flash = pricing::quote(usage, "deepseek-flash", "off");
+        CHECK(flash.known);
+        CHECK(std::abs(flash.usd - 0.15) < 1e-9);
+
+        const auto alias = pricing::quote(usage, "deepseek-v4-flash", "off");
+        CHECK(alias.known);
+        CHECK(std::abs(alias.usd - flash.usd) < 1e-12);
+
+        const auto unknown = pricing::quote(usage, "unknown-model", "off");
+        CHECK(!unknown.known);
+        CHECK(unknown.usd >= flash.usd);
+
+        CHECK(pricing::budget_cost(1'000'000, 0, "deepseek-flash") > flash.usd);
+        CHECK(std::abs(pricing::web_call_cost(1'000) - 0.75) < 1e-12);
+    }
+
+    SPARSITY_TEST(session_cost_is_persisted) {
+        TemporaryDirectory directory;
+        sparsity::session::Store store(directory.path());
+        auto created = store.create("project", directory.path().string(), "deepseek-flash", "high");
+
+        sparsity::llm::AssistantMessage message;
+        message.content.push_back({{"type", "text"}, {"text", "hello"}});
+        message.model = "deepseek-flash";
+        message.usage.input_tokens = 1'000'000;
+        const auto cost = created->add_assistant(message);
+        CHECK(cost > 0.0);
+        CHECK(std::abs(created->cost() - cost) < 1e-12);
+
+        const auto restored = store.load("project", created->id());
+        CHECK(restored != nullptr);
+        CHECK(std::abs(restored->cost() - cost) < 1e-12);
+    }
+
+    SPARSITY_TEST(session_system_snapshot_and_updates) {
+        TemporaryDirectory directory;
+        sparsity::session::Store store(directory.path());
+        auto created = store.create("project", directory.path().string(), "deepseek-flash", "high");
+
+        created->add_system_prompt("frozen system", "hash-1");
+        CHECK_EQ(created->system_prompt(), std::string{"frozen system"});
+        CHECK_EQ(created->instructions_hash(), std::string{"hash-1"});
+
+        created->add_system_update("updated system");
+        created->add_instruction_state("hash-2", "user");
+        const auto messages = created->messages();
+        CHECK_EQ(messages.size(), std::size_t{1});
+        CHECK_EQ(messages[0].value("role", std::string{}), std::string{"system"});
+        CHECK_EQ(messages[0]["content"][0].value("text", std::string{}), std::string{"updated system"});
+
+        const auto restored = store.load("project", created->id());
+        CHECK(restored != nullptr);
+        CHECK_EQ(restored->system_prompt(), std::string{"frozen system"});
+        CHECK_EQ(restored->instructions_hash(), std::string{"hash-1"});
+        CHECK_EQ(restored->instruction_state().hash, std::string{"hash-2"});
+        CHECK_EQ(restored->instruction_state().mode, std::string{"user"});
+    }
+
+    SPARSITY_TEST(compactor_counts_system_and_tools) {
+        TemporaryDirectory directory;
+        sparsity::session::Store store(directory.path());
+        auto created = store.create("project", directory.path().string(), "deepseek-flash", "high");
+        for (int index = 0; index < 4; ++index) {
+            created->add_user("message " + std::to_string(index));
+            sparsity::llm::AssistantMessage message;
+            message.content.push_back({{"type", "text"}, {"text", "reply"}});
+            created->add_assistant(message);
+        }
+
+        sparsity::config::Config config;
+        config.compaction.context_window = 8192;
+        config.compaction.threshold_ratio = 0.8;
+        config.compaction.headroom_tokens = 0;
+        config.max_output_tokens = 256;
+        sparsity::compaction::Compactor compactor(config, *created, 8192);
+        const auto messages = created->messages();
+        CHECK(!compactor.should_compact(messages));
+        CHECK(compactor.should_compact(messages, std::string(40000, 'x'),
+                                       sparsity::json::json_type::array()));
+    }
+
+    SPARSITY_TEST(session_image_offload_projection) {
+        TemporaryDirectory directory;
+        write_file(directory.path() / "a.jpg", "not-a-real-jpeg");
+        sparsity::session::Store store(directory.path());
+        auto created = store.create("project", directory.path().string(), "deepseek-flash", "high");
+
+        const sparsity::json::json_type attachments = sparsity::json::json_type::array({
+            {{"type", "image_ref"}, {"path", (directory.path() / "a.jpg").string()},
+             {"media_type", "image/jpeg"}, {"bytes", 3000000}},
+            {{"type", "image_ref"}, {"path", (directory.path() / "b.jpg").string()},
+             {"media_type", "image/jpeg"}, {"bytes", 2000000}},
+        });
+        created->add_user("look", attachments);
+
+        const auto before = created->image_occurrences();
+        CHECK_EQ(before.size(), std::size_t{2});
+        CHECK(!before[0].offloaded);
+        CHECK(!before[1].offloaded);
+
+        const auto seq = created->events().back()["seq"].get<int>();
+        created->add_image_offload(sparsity::json::json_type::array({
+            {{"seq", seq}, {"indexes", sparsity::json::json_type::array({0})}},
+        }));
+
+        const auto after = created->image_occurrences();
+        CHECK_EQ(after.size(), std::size_t{2});
+        CHECK(after[0].offloaded);
+        CHECK(!after[1].offloaded);
+
+        const auto messages = created->messages();
+        CHECK_EQ(messages.size(), std::size_t{1});
+        const auto &content = messages[0]["content"];
+        CHECK_EQ(content[1].value("type", std::string{}), std::string{"text"});
+        CHECK(content[1].value("text", std::string{}).find("image offloaded") != std::string::npos);
+        CHECK_EQ(content[2].value("type", std::string{}), std::string{"text"});
+        CHECK(content[2].value("text", std::string{}).find("image unavailable") != std::string::npos);
+
+        const auto restored = store.load("project", created->id());
+        CHECK(restored != nullptr);
+        const auto restored_occurrences = restored->image_occurrences();
+        CHECK_EQ(restored_occurrences.size(), std::size_t{2});
+        CHECK(restored_occurrences[0].offloaded);
     }
 }
 

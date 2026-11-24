@@ -4,6 +4,8 @@ module;
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
@@ -122,7 +124,32 @@ namespace sparsity::agent {
         return value;
     }
 
-    std::string system_prompt(const AgentContext &context, const std::string &model) {
+    std::string read_instructions(const AgentContext &context) {
+        std::ostringstream instructions;
+        std::size_t total = 0;
+        const std::vector<std::filesystem::path> candidates = {
+            context.home / "SPARSITY.md",
+            context.playground.root / "SPARSITY.md",
+            context.project.root / "SPARSITY.md",
+        };
+        std::vector<std::filesystem::path> seen;
+        for (const auto &path: candidates) {
+            std::error_code error;
+            const auto canonical = std::filesystem::weakly_canonical(path, error);
+            if (error || !std::filesystem::is_regular_file(canonical, error)) continue;
+            if (std::find(seen.begin(), seen.end(), canonical) != seen.end()) continue;
+            seen.push_back(canonical);
+            const auto text = read_text(canonical, 20'000);
+            if (text.empty()) continue;
+            if (total + text.size() > 60'000) break;
+            total += text.size();
+            instructions << "\n<project-instructions source=\"" << canonical.string() << "\">\n"
+                         << text << "\n</project-instructions>\n";
+        }
+        return instructions.str();
+    }
+
+    std::string system_prompt(const AgentContext &context, const std::string &instructions) {
         std::ostringstream prompt;
         prompt << "You are sparsity, a coding agent working in project " << context.project.name
                << " inside playground " << context.playground.root << ".\n\n";
@@ -133,8 +160,7 @@ namespace sparsity::agent {
         }
         prompt << "- playground: " << context.playground.root << '\n';
         prompt << "- time: the latest <time-context> message has the current local time\n";
-        prompt << "- shell: bash (persistent, hidden; use the bash tool)\n";
-        prompt << "- model: " << model << "\n\n";
+        prompt << "- shell: bash (persistent, hidden; use the bash tool)\n\n";
         prompt << "## How to work\n";
         prompt << "- Read before you edit. Keep changes small and reviewable.\n";
         prompt << "- Relative paths resolve against the project root.\n";
@@ -156,28 +182,19 @@ namespace sparsity::agent {
         prompt << "- Code and code comments in English.\n";
         prompt << "- Be direct. No filler, no restating the question.\n";
         prompt << "- Use Markdown. Short paragraphs.\n";
-
-        std::size_t total = 0;
-        const std::vector<std::filesystem::path> candidates = {
-            context.home / "SPARSITY.md",
-            context.playground.root / "SPARSITY.md",
-            context.project.root / "SPARSITY.md",
-        };
-        std::vector<std::filesystem::path> seen;
-        for (const auto &path: candidates) {
-            std::error_code error;
-            const auto canonical = std::filesystem::weakly_canonical(path, error);
-            if (error || !std::filesystem::is_regular_file(canonical, error)) continue;
-            if (std::find(seen.begin(), seen.end(), canonical) != seen.end()) continue;
-            seen.push_back(canonical);
-            const auto text = read_text(canonical, 20'000);
-            if (text.empty()) continue;
-            if (total + text.size() > 60'000) break;
-            total += text.size();
-            prompt << "\n<project-instructions source=\"" << canonical.string() << "\">\n"
-                   << text << "\n</project-instructions>\n";
-        }
+        prompt << instructions;
         return prompt.str();
+    }
+
+    std::string fnv_hash(const std::string_view text) {
+        std::uint64_t hash = 1469598103934665603ULL;
+        for (const unsigned char byte: text) {
+            hash ^= byte;
+            hash *= 1099511628211ULL;
+        }
+        char buffer[24];
+        std::snprintf(buffer, sizeof(buffer), "%016llx", static_cast<unsigned long long>(hash));
+        return buffer;
     }
 
     json_type card_json(const tools::ApprovalCard &card) {
@@ -271,6 +288,8 @@ namespace sparsity::agent {
                     {"summary", event.value("summary", std::string{})},
                     {"before_tokens", event.value("before", 0)},
                     {"after_tokens", event.value("after", 0)},
+                    {"hard_trimmed", event.value("hard_trimmed", false)},
+                    {"dropped_messages", event.value("dropped_messages", 0)},
                 });
             }
         }
@@ -349,6 +368,140 @@ export namespace sparsity::agent {
         state.max_steps = limits.max_steps.value_or(context.config.max_steps);
         state.max_turn_cost = limits.max_turn_cost.value_or(context.config.max_turn_cost);
         state.cost = session->cost();
+
+        // The leading system prompt is frozen for the life of the session.
+        // Instruction changes are appended, so the cached prefix stays warm.
+        auto current_instructions = read_instructions(context);
+        const auto actual_hash = fnv_hash(current_instructions);
+        auto frozen_system = session->system_prompt();
+        auto leading_hash = session->instructions_hash();
+        auto instruction_state = session->instruction_state();
+        if (frozen_system.empty()) {
+            frozen_system = system_prompt(context, current_instructions);
+            session->add_system_prompt(frozen_system, actual_hash);
+            leading_hash = actual_hash;
+            instruction_state = {actual_hash, "system"};
+        } else {
+            if (leading_hash.empty()) leading_hash = actual_hash;
+            if (instruction_state.hash.empty()) instruction_state = {leading_hash, "system"};
+        }
+        auto current_hash = instruction_state.hash;
+        auto last_system_update_hash = instruction_state.mode == "system" ? current_hash : std::string{};
+        auto last_leading_notice_hash = instruction_state.mode == "user" ? current_hash : std::string{};
+
+        auto sync_instructions = [&] {
+            const auto latest = read_instructions(context);
+            const auto latest_hash = fnv_hash(latest);
+            std::string model;
+            {
+                std::lock_guard lock(state.mutex);
+                model = state.model;
+            }
+            const auto *info = models::find(context.catalog, model);
+            const bool in_history = info != nullptr && info->system_prompt_update == "in-history";
+            if (latest_hash != current_hash) {
+                current_instructions = latest;
+                current_hash = latest_hash;
+                if (in_history) {
+                    session->add_system_update(system_prompt(context, current_instructions));
+                    session->add_instruction_state(current_hash, "system");
+                    last_system_update_hash = current_hash;
+                    send({
+                        {"type", "notice"},
+                        {"kind", "instructions"},
+                        {"message", "Project instructions changed; appended as a system update."},
+                    });
+                } else {
+                    session->add_context(
+                        "<project-instructions-update>\n" + current_instructions +
+                        "\n</project-instructions-update>\n");
+                    session->add_instruction_state(current_hash, "user");
+                    last_leading_notice_hash = current_hash;
+                    send({
+                        {"type", "notice"},
+                        {"kind", "instructions"},
+                        {"message", "Project instructions changed; appended as a user message because this model only honors a leading system prompt."},
+                    });
+                }
+                return;
+            }
+            if (in_history && current_hash != last_system_update_hash) {
+                session->add_system_update(system_prompt(context, current_instructions));
+                session->add_instruction_state(current_hash, "system");
+                last_system_update_hash = current_hash;
+            } else if (!in_history && current_hash != leading_hash &&
+                       current_hash != last_leading_notice_hash) {
+                session->add_context(
+                    "<project-instructions-update>\n" + current_instructions +
+                    "\n</project-instructions-update>\n");
+                session->add_instruction_state(current_hash, "user");
+                last_leading_notice_hash = current_hash;
+            }
+        };
+
+        auto ensure_image_budget = [&] {
+            auto occurrences = session->image_occurrences();
+            std::size_t bytes = 0;
+            int count = 0;
+            std::vector<bool> recent(occurrences.size(), false);
+            std::vector<std::size_t> retained;
+            for (std::size_t index = 0; index < occurrences.size(); ++index) {
+                if (occurrences[index].offloaded) continue;
+                ++count;
+                bytes += (occurrences[index].bytes + 2) / 3 * 4;
+                retained.push_back(index);
+            }
+            const std::size_t keep_recent = std::min<std::size_t>(4, retained.size());
+            for (std::size_t index = retained.size() - keep_recent; index < retained.size(); ++index) {
+                recent[retained[index]] = true;
+            }
+            const auto limit_images = context.config.images.max_request_images;
+            const auto limit_bytes = static_cast<std::size_t>(context.config.images.max_request_bytes);
+            const auto over = [&] {
+                return count > limit_images || bytes > limit_bytes;
+            };
+            if (!over()) return;
+            // Batch the trim: leave headroom so the next few images do not
+            // invalidate the prefix again on the very next step.
+            const auto target_images = std::max(1, limit_images * 4 / 5);
+            const auto target_bytes = limit_bytes * 4 / 5;
+            const auto needs_trim = [&] {
+                return count > target_images || bytes > target_bytes;
+            };
+
+            std::map<int, std::vector<int>> grouped;
+            std::vector<bool> selected(occurrences.size(), false);
+            const auto select = [&](const bool include_recent) {
+                for (std::size_t index = 0; index < occurrences.size() && needs_trim(); ++index) {
+                    if (occurrences[index].offloaded || selected[index]) continue;
+                    if (!include_recent && recent[index]) continue;
+                    selected[index] = true;
+                    grouped[occurrences[index].seq].push_back(occurrences[index].index);
+                    --count;
+                    const auto base64_bytes = (occurrences[index].bytes + 2) / 3 * 4;
+                    bytes = base64_bytes <= bytes ? bytes - base64_bytes : 0;
+                }
+            };
+            select(false);
+            select(true);
+            if (grouped.empty()) return;
+
+            json_type targets = json_type::array();
+            for (const auto &[seq, indexes]: grouped) {
+                json_type list = json_type::array();
+                for (const auto index: indexes) list.push_back(index);
+                targets.push_back({{"seq", seq}, {"indexes", std::move(list)}});
+            }
+            session->add_image_offload(targets);
+            send({
+                {"type", "notice"},
+                {"kind", "image_offload"},
+                {"message", "Offloaded older images to stay within the request image budget."},
+                {"offloaded", static_cast<int>(std::count(selected.begin(), selected.end(), true))},
+                {"remaining_images", count},
+                {"remaining_bytes", static_cast<std::int64_t>(bytes)},
+            });
+        };
 
         tools::BashSession shell(context.project.root);
         auto web = std::make_shared<tools::WebClient>(
@@ -437,7 +590,17 @@ export namespace sparsity::agent {
             {"effort", state.effort},
             {"permissions", state.permissions},
             {"status", "idle"},
+            {"prices_version", pricing::prices_version()},
+            {"pricing_known", pricing::prices_for(state.model).has_value()},
         });
+        if (!pricing::prices_for(state.model).has_value()) {
+            send({
+                {"type", "notice"},
+                {"kind", "pricing"},
+                {"message", "No bundled price for model " + state.model +
+                                "; budget estimates use the highest known DeepSeek price."},
+            });
+        }
         send({{"type", "history"}, {"events", history(*session, executor)}});
         send_state();
 
@@ -452,6 +615,7 @@ export namespace sparsity::agent {
                 max_steps = state.max_steps;
                 max_turn_cost = state.max_turn_cost;
             }
+            sync_instructions();
             session->add_context(time_context());
             session->add_user(text, attachments);
             send_state();
@@ -500,10 +664,38 @@ export namespace sparsity::agent {
                 finish("cost_budget");
                 return true;
             };
+            auto request_within_budget = [&](const llm::Request &request) -> bool {
+                if (max_turn_cost <= 0.0) return true;
+                double spent = 0.0;
+                {
+                    std::lock_guard lock(state.mutex);
+                    spent = state.turn_cost;
+                }
+                const auto estimated = compactor.meter().estimate_messages(request.messages) +
+                                       compactor.meter().estimate_text(request.system) +
+                                       compactor.meter().estimate_text(request.tools.dump());
+                const auto worst = pricing::budget_cost(
+                    static_cast<int>(estimated * 1.15) + 1024, request.max_tokens, request.model);
+                if (spent + worst <= max_turn_cost) return true;
+                std::ostringstream message;
+                message << "Next request could exceed the turn budget (estimated worst case $"
+                        << std::fixed << std::setprecision(3) << worst << ", spent $" << spent
+                        << ", limit $" << max_turn_cost << "). Increase the budget or compact first.";
+                send({
+                    {"type", "notice"},
+                    {"kind", "cost_budget"},
+                    {"message", message.str()},
+                    {"prompt", "continue"},
+                    {"label", "Continue"},
+                });
+                finish("cost_budget");
+                return false;
+            };
             int loop_serial = 0;
             std::string repeat_signature;
             int repeat_count = 0;
             bool repeat_suppressed = false;
+            bool auto_compaction_blocked = false;
             auto request_loop_decision = [&](const std::string &tool, const std::string &summary,
                                              const int count) -> bool {
                 const auto id = "loop-" + std::to_string(++loop_serial);
@@ -559,11 +751,12 @@ export namespace sparsity::agent {
                                             ? context.config.max_output_tokens
                                             : std::min(context.config.max_output_tokens,
                                                        static_cast<int>(info->max_output_tokens));
-                const auto system = system_prompt(context, model);
+                const auto system = frozen_system;
                 const auto schemas = executor.schemas();
+                ensure_image_budget();
                 auto messages = session->messages();
 
-                if (compactor.should_compact(messages)) {
+                if (!auto_compaction_blocked && compactor.should_compact(messages, system, schemas)) {
                     auto token = std::make_shared<http::Cancel>();
                     {
                         std::lock_guard lock(state.mutex);
@@ -581,16 +774,29 @@ export namespace sparsity::agent {
                                 {"summary", outcome->summary},
                                 {"before_tokens", outcome->before_tokens},
                                 {"after_tokens", outcome->after_tokens},
+                                {"hard_trimmed", outcome->hard_trimmed},
+                                {"dropped_messages", outcome->dropped_messages},
                             });
-                            add_turn_cost(pricing::estimate_cost(
-                                outcome->usage, outcome->model.empty() ? model : outcome->model));
+                            add_turn_cost(outcome->cost);
                             {
                                 std::lock_guard lock(state.mutex);
                                 state.ctx_tokens = outcome->after_tokens;
                             }
                             send_state();
                             if (cost_limit_reached()) return;
+                            if (!outcome->fits) {
+                                send({
+                                    {"type", "error"},
+                                    {"kind", "context_length"},
+                                    {"message", "History is still larger than the context window after compaction. Start a new session or shorten the input."},
+                                });
+                                finish("error");
+                                return;
+                            }
                             messages = session->messages();
+                        } else {
+                            // Do not retry a failing auto-compaction on every step.
+                            auto_compaction_blocked = true;
                         }
                     } catch (const llm::Error &error) {
                         {
@@ -632,6 +838,7 @@ export namespace sparsity::agent {
                         std::lock_guard lock(state.mutex);
                         state.cancel = cancel;
                     }
+                    if (!request_within_budget(request)) return;
                     llm::MessageAccumulator attempt;
                     const auto estimated = compactor.meter().estimate_messages(messages);
                     try {
@@ -679,15 +886,25 @@ export namespace sparsity::agent {
                                     {"summary", outcome->summary},
                                     {"before_tokens", outcome->before_tokens},
                                     {"after_tokens", outcome->after_tokens},
+                                    {"hard_trimmed", outcome->hard_trimmed},
+                                    {"dropped_messages", outcome->dropped_messages},
                                 });
-                                add_turn_cost(pricing::estimate_cost(
-                                    outcome->usage, outcome->model.empty() ? model : outcome->model));
+                                add_turn_cost(outcome->cost);
                                 {
                                     std::lock_guard lock(state.mutex);
                                     state.ctx_tokens = outcome->after_tokens;
                                 }
                                 send_state();
                                 if (cost_limit_reached()) return;
+                                if (!outcome->fits) {
+                                    send({
+                                        {"type", "error"},
+                                        {"kind", "context_length"},
+                                        {"message", "History is still larger than the context window after forced compaction. Start a new session or shorten the input."},
+                                    });
+                                    finish("error");
+                                    return;
+                                }
                                 messages = session->messages();
                             } catch (const std::exception &failed) {
                                 {
@@ -703,9 +920,9 @@ export namespace sparsity::agent {
                         if (error.kind == "canceled" || state.interrupted.load(std::memory_order_relaxed)) {
                             auto partial = attempt.message();
                             last_usage = partial.usage;
-                            if (!partial.content.empty()) {
+                            if (!partial.content.empty() || partial.usage.total() > 0) {
                                 partial.interrupted = true;
-                                session->add_assistant(partial);
+                                add_turn_cost(session->add_assistant(partial));
                             }
                             session->add_abort("canceled");
                             finish("aborted");
@@ -731,9 +948,7 @@ export namespace sparsity::agent {
                     return;
                 }
                 last_usage = message.usage;
-                session->add_assistant(message);
-                add_turn_cost(pricing::estimate_cost(
-                    message.usage, message.model.empty() ? model : message.model));
+                add_turn_cost(session->add_assistant(message));
                 {
                     std::lock_guard lock(state.mutex);
                     state.ctx_tokens = last_usage.total_input();
@@ -774,7 +989,14 @@ export namespace sparsity::agent {
                         state.current_id = call.id;
                         state.approval.reset();
                     }
+                    const auto web_before = web ? web->cost() : 0.0;
                     const auto result = executor.execute(call);
+                    const auto web_after = web ? web->cost() : 0.0;
+                    if (web_after > web_before) {
+                        const auto web_cost = web_after - web_before;
+                        session->add_api_cost("web", 1, web_cost);
+                        add_turn_cost(web_cost);
+                    }
                     session->add_tool_result(call.id, json_type(result.blocks), result.is_error);
                     send({
                         {"type", "tool_result"},
@@ -907,7 +1129,7 @@ export namespace sparsity::agent {
             if (session->model() != model || session->effort() != effort) {
                 session->add_switch(model, effort);
             }
-            const auto system = system_prompt(context, model);
+            const auto system = frozen_system;
             const auto schemas = executor.schemas();
             auto token = std::make_shared<http::Cancel>();
             {
@@ -1028,9 +1250,19 @@ export namespace sparsity::agent {
                 } else if (type == "settings") {
                     if (value.contains("model") && value["model"].is_string()) {
                         const auto model = choose_model(context, value["model"].get<std::string>());
-                        std::lock_guard lock(state.mutex);
-                        state.model = model;
-                        state.effort = choose_effort(context, model, state.effort);
+                        {
+                            std::lock_guard lock(state.mutex);
+                            state.model = model;
+                            state.effort = choose_effort(context, model, state.effort);
+                        }
+                        if (!pricing::prices_for(model).has_value()) {
+                            send({
+                                {"type", "notice"},
+                                {"kind", "pricing"},
+                                {"message", "No bundled price for model " + model +
+                                                "; budget estimates use the highest known DeepSeek price."},
+                            });
+                        }
                     }
                     if (value.contains("effort") && value["effort"].is_string()) {
                         std::lock_guard lock(state.mutex);

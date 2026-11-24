@@ -134,7 +134,7 @@ export type ChatEvent =
     }
   | { type: "tool_result"; id: string; tool_use_id?: string; text: string; is_error: boolean; display: string; images?: ToolResult["images"] }
   | { type: "todos"; items: Array<{ content: string; status: string }> }
-  | { type: "compaction"; summary: string; before_tokens: number; after_tokens: number }
+  | { type: "compaction"; summary: string; before_tokens: number; after_tokens: number; hard_trimmed?: boolean }
   | { type: "switch"; model: string; effort: string }
   | { type: "abort"; reason: string };
 
@@ -158,7 +158,7 @@ export type ChatItem =
     }
   | { kind: "tool"; id: string; call: ToolCall }
   | { kind: "approval"; id: string; call: ToolCall; card: ApprovalCard; decision?: string }
-  | { kind: "compaction"; id: string; summary: string; before: number; after: number }
+  | { kind: "compaction"; id: string; summary: string; before: number; after: number; hardTrimmed?: boolean }
   | { kind: "notice"; id: string; message: string; action?: { label: string; prompt: string } }
   | { kind: "loop"; id: string; message: string; tool?: string; count?: number; summary?: string; level?: number; checkId?: string; decision?: "continue" | "stop" }
   | { kind: "error"; id: string; message: string };
